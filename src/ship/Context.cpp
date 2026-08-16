@@ -446,6 +446,9 @@ std::string Context::GetShortName() {
 }
 
 std::string Context::GetAppBundlePath() {
+#ifdef __vita__	
+	return std::string("ux0:data/ghostship");
+#endif
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -514,7 +517,10 @@ std::string Context::GetAppBundlePath() {
 #endif
 }
 
-std::string Context::GetAppDirectoryPath(std::string appName) {
+std::string Context::GetAppDirectoryPath(const std::string& appName) {
+#ifdef __vita__
+    return std::string("ux0:data/battleship");
+#endif
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {

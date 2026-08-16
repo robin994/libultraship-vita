@@ -20,6 +20,9 @@
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"
 
+#include "fast/types.h"
+#include "robin_hood.h"
+
 // TODO figure out why changing these to 640x480 makes the game only render in a quarter of the window
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
@@ -29,6 +32,10 @@
 
 #ifdef __cplusplus
 #include <compare>
+#endif
+
+#ifdef __vita__
+#include <vitasdk.h>
 #endif
 
 /*enum {
@@ -184,6 +191,16 @@ struct TextureCacheKey {
     uint8_t masks, maskt;
     uint16_t tile_width, tile_height;
 
+#ifdef __vita__
+    bool operator==(const TextureCacheKey& rhs) const {
+        return !sceClibMemcmp(&rhs, this, sizeof(TextureCacheKey));
+    };
+    struct Hasher {
+        size_t operator()(const TextureCacheKey& key) const noexcept {
+            return (size_t)key.texture_addr;
+        }
+    };
+#else
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
     struct Hasher {
@@ -205,10 +222,8 @@ struct TextureCacheKey {
             return (size_t)h;
         }
     };
+#endif
 };
-
-typedef std::unordered_map<TextureCacheKey, struct TextureCacheValue, TextureCacheKey::Hasher> TextureCacheMap;
-typedef std::pair<const TextureCacheKey, struct TextureCacheValue> TextureCacheNode;
 
 struct TextureCacheValue {
     uint32_t texture_id;
@@ -223,6 +238,10 @@ struct TextureCacheValue {
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
+
+typedef std::unordered_map<TextureCacheKey, struct TextureCacheValue, TextureCacheKey::Hasher> TextureCacheMap;
+typedef std::pair<const TextureCacheKey, struct TextureCacheValue> TextureCacheNode;
+
 
 struct TextureCacheMapIter {
     TextureCacheMap::iterator it;
@@ -408,7 +427,7 @@ class Interpreter {
     GfxRenderingAPI* GetCurrentRenderingAPI();
     void StartFrame();
     void RunGuiOnly();
-    void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
+    void Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>& mtx_replacements);
     void PresentCurrentFramebuffer();
     void EndFrame();
     void HandleWindowEvents();
@@ -600,6 +619,7 @@ class Interpreter {
     XYWidthHeight mNativeDimensions{};     // gfx_native_dimensions;
     XYWidthHeight mPrevNativeDimensions{}; // gfx_prev_native_dimensions;
     uintptr_t mGfxFrameBuffer{};
+	float mCurAspectRatioDeltaForX = (4.f / 3.f);
 
     unsigned int mMsaaLevel = 1;
     bool mDroppedFrame{};
@@ -669,7 +689,7 @@ class Interpreter {
     };
     FbUvTransform mFbUvTransform[2] = { { 1.0f, 1.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f, 0.0f } };
 
-    const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
+    const robin_hood::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?
     std::unordered_map<size_t, const char*> mShaders;
 

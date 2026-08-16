@@ -20,11 +20,7 @@
 
 #include "fast/backends/gfx_opengl.h"
 #include "ship/window/gui/Gui.h"
-#include <prism/processor.h>
-#include <fstream>
 #include "ship/Context.h"
-#include "ship/resource/factory/ShaderFactory.h"
-#include "fast/interpreter.h"
 #include "ship/config/ConsoleVariable.h"
 
 #include <vector>
@@ -37,6 +33,14 @@
 #define STB_IMAGE_WRITE_STATIC
 #include "stb_image_write.h"
 
+#ifdef __vita__
+#include <psp2/gxm.h>
+extern "C" {
+    void vglBufferData(GLenum target, const GLvoid *data);
+};
+#define SHADER_MAGIC (1)
+#endif
+
 namespace Fast {
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
     GLint max_texture_size;
@@ -48,8 +52,8 @@ const char* GfxRenderingAPIOGL::GetName() {
     return "OpenGL";
 }
 
-GfxClipParameters GfxRenderingAPIOGL::GetClipParameters() {
-    return { false, mFrameBuffers[mCurrentFrameBuffer].invertY };
+bool GfxRenderingAPIOGL::GetClipParameters() {
+    return mFrameBuffers[mCurrentFrameBuffer].invertY;
 }
 
 static void VertexArraySetAttribs(ShaderProgram* prg) {
@@ -72,16 +76,6 @@ void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
 }
 
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
-    if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
-        GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
-        glUniform1iv(mCurrentShaderProgram->texture_filtering_location, 2, filtering);
-
-        GLint width[2] = { textures[mCurrentTextureIds[0]].width, textures[mCurrentTextureIds[1]].width };
-        glUniform1iv(mCurrentShaderProgram->texture_width_location, 2, width);
-
-        GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
-        glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
-    }
 }
 
 void GfxRenderingAPIOGL::UnloadShader(ShaderProgram* old_prg) {
@@ -183,270 +177,499 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
     return "";
 }
 
-bool get_bool(prism::ContextTypes* value) {
-    if (std::holds_alternative<int>(*value)) {
-        return std::get<int>(*value) == 1;
+static void append_str(char* buf, size_t* len, const char* str) {
+    while (*str != '\0') {
+        buf[(*len)++] = *str++;
     }
-    return false;
 }
 
-prism::ContextTypes* append_formula(prism::ContextTypes* _, prism::ContextTypes* a_arg, prism::ContextTypes* a_single,
-                                    prism::ContextTypes* a_mult, prism::ContextTypes* a_mix,
-                                    prism::ContextTypes* a_with_alpha, prism::ContextTypes* a_only_alpha,
-                                    prism::ContextTypes* a_alpha, prism::ContextTypes* a_first_cycle) {
-    auto c = std::get<prism::MTDArray<int>>(*a_arg);
-    bool do_single = get_bool(a_single);
-    bool do_multiply = get_bool(a_mult);
-    bool do_mix = get_bool(a_mix);
-    bool with_alpha = get_bool(a_with_alpha);
-    bool only_alpha = get_bool(a_only_alpha);
-    bool opt_alpha = get_bool(a_alpha);
-    bool first_cycle = get_bool(a_first_cycle);
-    std::string out = "";
+static void append_line(char* buf, size_t* len, const char* str) {
+    while (*str != '\0') {
+        buf[(*len)++] = *str++;
+    }
+    buf[(*len)++] = '\n';
+}
+
+static void append_formula(char* buf, size_t* len, const int c[2][4],
+                           bool do_single, bool do_multiply, bool do_mix,
+                           bool with_alpha, bool only_alpha, bool opt_alpha, bool first_cycle) {
     if (do_single) {
-        out += shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        append_str(buf, len, shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, first_cycle, false));
     } else if (do_multiply) {
-        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
-        out += " * ";
-        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
+        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, first_cycle, false));
+        append_str(buf, len, " * ");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, first_cycle, true));
     } else if (do_mix) {
-        out += "mix(";
-        out += shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
-        out += ", ";
-        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
-        out += ", ";
-        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
-        out += ")";
+        append_str(buf, len, "mix(");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, first_cycle, false));
+        append_str(buf, len, ", ");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, first_cycle, false));
+        append_str(buf, len, ", ");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, first_cycle, true));
+        append_str(buf, len, ")");
     } else {
-        out += "(";
-        out += shader_item_to_str(c.at(only_alpha, 0), with_alpha, only_alpha, opt_alpha, first_cycle, false);
-        out += " - ";
-        out += shader_item_to_str(c.at(only_alpha, 1), with_alpha, only_alpha, opt_alpha, first_cycle, false);
-        out += ") * ";
-        out += shader_item_to_str(c.at(only_alpha, 2), with_alpha, only_alpha, opt_alpha, first_cycle, true);
-        out += " + ";
-        out += shader_item_to_str(c.at(only_alpha, 3), with_alpha, only_alpha, opt_alpha, first_cycle, false);
+        append_str(buf, len, "(");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, first_cycle, false));
+        append_str(buf, len, " - ");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, first_cycle, false));
+        append_str(buf, len, ") * ");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, first_cycle, true));
+        append_str(buf, len, " + ");
+        append_str(buf, len, shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, first_cycle, false));
     }
-    return new prism::ContextTypes{ out };
 }
 
-std::optional<std::string> opengl_include_fs(const std::string& path) {
-    auto init = std::make_shared<Ship::ResourceInitData>();
-    init->Type = (uint32_t)Ship::ResourceType::Shader;
-    init->ByteOrder = Ship::Endianness::Native;
-    init->Format = RESOURCE_FORMAT_BINARY;
-    auto res = std::static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
-    if (res == nullptr) {
-        return std::nullopt;
-    }
-    auto inc = static_cast<std::string*>(res->GetRawPointer());
-    return *inc;
-}
+static std::string BuildVsShaderInline(const CCFeatures& cc_features, size_t& out_num_floats) {
+    char vs_buf[4096];
+    size_t vs_len = 0;
+    size_t num_floats = 4;
 
-std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
-    prism::Processor processor;
-    prism::ContextItems mContext = {
-        { "VERTEX_SHADER", false },
-        { "o_c", M_ARRAY(cc_features.c, int, 2, 2, 4) },
-        { "o_alpha", cc_features.opt_alpha },
-        { "o_fog", cc_features.opt_fog },
-        { "o_texture_edge", cc_features.opt_texture_edge },
-        { "o_noise", cc_features.opt_noise },
-        { "o_2cyc", cc_features.opt_2cyc },
-        { "o_alpha_threshold", cc_features.opt_alpha_threshold },
-        { "o_invisible", cc_features.opt_invisible },
-        { "o_grayscale", cc_features.opt_grayscale },
-        { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
-        { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
-        { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
-        { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
-        { "o_inputs", cc_features.numInputs },
-        { "o_do_mix", M_ARRAY(cc_features.do_mix, bool, 2, 2) },
-        { "o_do_single", M_ARRAY(cc_features.do_single, bool, 2, 2) },
-        { "o_do_multiply", M_ARRAY(cc_features.do_multiply, bool, 2, 2) },
-        { "o_color_alpha_same", M_ARRAY(cc_features.color_alpha_same, bool, 2) },
-        { "FILTER_THREE_POINT", FILTER_THREE_POINT },
-        { "FILTER_LINEAR", FILTER_LINEAR },
-        { "FILTER_NONE", FILTER_NONE },
-        { "srgb_mode", mSrgbMode },
-        { "SHADER_0", SHADER_0 },
-        { "SHADER_INPUT_1", SHADER_INPUT_1 },
-        { "SHADER_INPUT_2", SHADER_INPUT_2 },
-        { "SHADER_INPUT_3", SHADER_INPUT_3 },
-        { "SHADER_INPUT_4", SHADER_INPUT_4 },
-        { "SHADER_INPUT_5", SHADER_INPUT_5 },
-        { "SHADER_INPUT_6", SHADER_INPUT_6 },
-        { "SHADER_INPUT_7", SHADER_INPUT_7 },
-        { "SHADER_TEXEL0", SHADER_TEXEL0 },
-        { "SHADER_TEXEL0A", SHADER_TEXEL0A },
-        { "SHADER_TEXEL1", SHADER_TEXEL1 },
-        { "SHADER_TEXEL1A", SHADER_TEXEL1A },
-        { "SHADER_1", SHADER_1 },
-        { "SHADER_COMBINED", SHADER_COMBINED },
-        { "SHADER_NOISE", SHADER_NOISE },
-        { "o_three_point_filtering", mCurrentFilterMode == FILTER_THREE_POINT },
-        { "append_formula", (InvokeFunc)append_formula },
-#ifdef __APPLE__
-        { "GLSL_VERSION", "#version 410 core" },
-        { "attr", "in" },
-        { "opengles", false },
-        { "core_opengl", true },
-        { "texture", "texture" },
-        { "vOutColor", "vOutColor" },
+#if defined(__APPLE__)
+    append_line(vs_buf, &vs_len, "#version 410 core");
+    append_line(vs_buf, &vs_len, "in vec4 aVtxPos;");
 #elif defined(USE_OPENGLES)
-        { "GLSL_VERSION", "#version 300 es\nprecision mediump float;" },
-        { "attr", "in" },
-        { "opengles", true },
-        { "core_opengl", false },
-        { "texture", "texture" },
-        { "vOutColor", "vOutColor" },
+    append_line(vs_buf, &vs_len, "#version 300 es");
+    append_line(vs_buf, &vs_len, "in vec4 aVtxPos;");
 #else
-        { "GLSL_VERSION", "#version 130" },
-        { "attr", "varying" },
-        { "opengles", false },
-        { "core_opengl", false },
-        { "texture", "texture2D" },
-        { "vOutColor", "gl_FragColor" },
+    append_line(vs_buf, &vs_len, "#version 110");
+    append_line(vs_buf, &vs_len, "attribute vec4 aVtxPos;");
 #endif
-    };
-    processor.populate(mContext);
-    auto init = std::make_shared<Ship::ResourceInitData>();
-    init->Type = (uint32_t)Ship::ResourceType::Shader;
-    init->ByteOrder = Ship::Endianness::Native;
-    init->Format = RESOURCE_FORMAT_BINARY;
-    const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
-    std::string path = "shaders/opengl/default.shader.glsl";
 
-    if (nullptr != shaderName) {
-        path = std::string(shaderName) + ".glsl";
+    for (int i = 0; i < 2; i++) {
+        if (cc_features.usedTextures[i]) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+            vs_len += sprintf(vs_buf + vs_len, "in vec2 aTexCoord%d;\n", i);
+            vs_len += sprintf(vs_buf + vs_len, "out vec2 vTexCoord%d;\n", i);
+#else
+            vs_len += sprintf(vs_buf + vs_len, "attribute vec2 aTexCoord%d;\n", i);
+            vs_len += sprintf(vs_buf + vs_len, "varying vec2 vTexCoord%d;\n", i);
+#endif
+            num_floats += 2;
+            for (int j = 0; j < 2; j++) {
+                if (cc_features.clamp[i][j]) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+                    vs_len += sprintf(vs_buf + vs_len, "in float aTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
+                    vs_len += sprintf(vs_buf + vs_len, "out float vTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
+#else
+                    vs_len += sprintf(vs_buf + vs_len, "attribute float aTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
+                    vs_len += sprintf(vs_buf + vs_len, "varying float vTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
+#endif
+                    num_floats += 1;
+                }
+            }
+        }
     }
 
-    auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
-
-    if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default fragment shader, missing f3d.o2r?");
-        abort();
+    if (cc_features.opt_fog) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(vs_buf, &vs_len, "in vec4 aFog;");
+        append_line(vs_buf, &vs_len, "out vec4 vFog;");
+#else
+        append_line(vs_buf, &vs_len, "attribute vec4 aFog;");
+        append_line(vs_buf, &vs_len, "varying vec4 vFog;");
+#endif
+        num_floats += 4;
     }
 
-    auto shader = static_cast<std::string*>(res->GetRawPointer());
-    processor.load(*shader);
-    processor.bind_include_loader(opengl_include_fs);
-    auto result = processor.process();
-    // SPDLOG_INFO("=========== FRAGMENT SHADER ============");
-    // SPDLOG_INFO(result);
-    // SPDLOG_INFO("========================================");
-    return result;
+    if (cc_features.opt_grayscale) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(vs_buf, &vs_len, "in vec4 aGrayscaleColor;");
+        append_line(vs_buf, &vs_len, "out vec4 vGrayscaleColor;");
+#else
+        append_line(vs_buf, &vs_len, "attribute vec4 aGrayscaleColor;");
+        append_line(vs_buf, &vs_len, "varying vec4 vGrayscaleColor;");
+#endif
+        num_floats += 4;
+    }
+
+    for (int i = 0; i < cc_features.numInputs; i++) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        vs_len += sprintf(vs_buf + vs_len, "in vec%d aInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
+        vs_len += sprintf(vs_buf + vs_len, "out vec%d vInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
+#else
+        vs_len += sprintf(vs_buf + vs_len, "attribute vec%d aInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
+        vs_len += sprintf(vs_buf + vs_len, "varying vec%d vInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
+#endif
+        num_floats += cc_features.opt_alpha ? 4 : 3;
+    }
+
+    append_line(vs_buf, &vs_len, "void main() {");
+
+    for (int i = 0; i < 2; i++) {
+        if (cc_features.usedTextures[i]) {
+            vs_len += sprintf(vs_buf + vs_len, "vTexCoord%d = aTexCoord%d;\n", i, i);
+            for (int j = 0; j < 2; j++) {
+                if (cc_features.clamp[i][j]) {
+                    vs_len += sprintf(vs_buf + vs_len, "vTexClamp%s%d = aTexClamp%s%d;\n",
+                                      j == 0 ? "S" : "T", i, j == 0 ? "S" : "T", i);
+                }
+            }
+        }
+    }
+
+    if (cc_features.opt_fog)       append_line(vs_buf, &vs_len, "vFog = aFog / 255.f;");
+    if (cc_features.opt_grayscale)  append_line(vs_buf, &vs_len, "vGrayscaleColor = aGrayscaleColor / 255.f;");
+
+    for (int i = 0; i < cc_features.numInputs; i++) {
+        vs_len += sprintf(vs_buf + vs_len, "vInput%d = aInput%d;\n", i + 1, i + 1);
+    }
+
+    append_line(vs_buf, &vs_len, "gl_Position = aVtxPos;");
+
+#if defined(USE_OPENGLES) || defined(__vita__)
+    append_line(vs_buf, &vs_len, "gl_Position.z *= 0.3f;");
+#endif
+
+    append_line(vs_buf, &vs_len, "}");
+
+    vs_buf[vs_len] = '\0';
+    out_num_floats = num_floats;
+    return std::string(vs_buf, vs_len);
 }
 
-static size_t numFloats = 0;
+static std::string BuildFsShaderInline(const CCFeatures& cc_features, FilteringMode filter_mode, bool srgb_mode) {
+    char fs_buf[16384];
+    size_t fs_len = 0;
 
-static prism::ContextTypes* UpdateFloats(prism::ContextTypes* _, prism::ContextTypes* num) {
-    numFloats += std::get<int>(*num);
-    return nullptr;
-}
-
-static std::string BuildVsShader(const CCFeatures& cc_features) {
-    numFloats = 4;
-    prism::Processor processor;
-    prism::ContextItems mContext = { { "VERTEX_SHADER", true },
-                                     { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
-                                     { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
-                                     { "o_fog", cc_features.opt_fog },
-                                     { "o_grayscale", cc_features.opt_grayscale },
-                                     { "o_alpha", cc_features.opt_alpha },
-                                     { "o_inputs", cc_features.numInputs },
-                                     { "update_floats", (InvokeFunc)UpdateFloats },
-#ifdef __APPLE__
-                                     { "GLSL_VERSION", "#version 410 core" },
-                                     { "attr", "in" },
-                                     { "out", "out" },
-                                     { "opengles", false }
+#if defined(__APPLE__)
+    append_line(fs_buf, &fs_len, "#version 410 core");
 #elif defined(USE_OPENGLES)
-                                     { "GLSL_VERSION", "#version 300 es" },
-                                     { "attr", "in" },
-                                     { "out", "out" },
-                                     { "opengles", true }
+    append_line(fs_buf, &fs_len, "#version 300 es");
+    append_line(fs_buf, &fs_len, "precision mediump float;");
 #else
-                                     { "GLSL_VERSION", "#version 110" },
-                                     { "attr", "attribute" },
-                                     { "out", "varying" },
-                                     { "opengles", false }
+    append_line(fs_buf, &fs_len, "#version 130");
 #endif
-    };
-    processor.populate(mContext);
 
-    auto init = std::make_shared<Ship::ResourceInitData>();
-    init->Type = (uint32_t)Ship::ResourceType::Shader;
-    init->ByteOrder = Ship::Endianness::Native;
-    init->Format = RESOURCE_FORMAT_BINARY;
-    const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
-    std::string path = "shaders/opengl/default.shader.glsl";
-
-    if (nullptr != shaderName) {
-        path = std::string(shaderName) + ".glsl";
+    for (int i = 0; i < 2; i++) {
+        if (cc_features.usedTextures[i]) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+            fs_len += sprintf(fs_buf + fs_len, "in vec2 vTexCoord%d;\n", i);
+#else
+            fs_len += sprintf(fs_buf + fs_len, "varying vec2 vTexCoord%d;\n", i);
+#endif
+            for (int j = 0; j < 2; j++) {
+                if (cc_features.clamp[i][j]) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+                    fs_len += sprintf(fs_buf + fs_len, "in float vTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
+#else
+                    fs_len += sprintf(fs_buf + fs_len, "varying float vTexClamp%s%d;\n", j == 0 ? "S" : "T", i);
+#endif
+                }
+            }
+        }
     }
 
-    auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
-
-    if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default vertex shader, missing f3d.o2r?");
-        abort();
+    if (cc_features.opt_fog) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "in vec4 vFog;");
+#else
+        append_line(fs_buf, &fs_len, "varying vec4 vFog;");
+#endif
     }
 
-    auto shader = static_cast<std::string*>(res->GetRawPointer());
-    processor.load(*shader);
-    processor.bind_include_loader(opengl_include_fs);
-    auto result = processor.process();
-    // SPDLOG_INFO("=========== VERTEX SHADER ============");
-    // SPDLOG_INFO(result);
-    // SPDLOG_INFO("========================================");
-    return result;
+    if (cc_features.opt_grayscale) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "in vec4 vGrayscaleColor;");
+#else
+        append_line(fs_buf, &fs_len, "varying vec4 vGrayscaleColor;");
+#endif
+    }
+
+    for (int i = 0; i < cc_features.numInputs; i++) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        fs_len += sprintf(fs_buf + fs_len, "in vec%d vInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
+#else
+        fs_len += sprintf(fs_buf + fs_len, "varying vec%d vInput%d;\n", cc_features.opt_alpha ? 4 : 3, i + 1);
+#endif
+    }
+
+    if (cc_features.usedTextures[0]) append_line(fs_buf, &fs_len, "uniform sampler2D uTex0;");
+    if (cc_features.usedTextures[1]) append_line(fs_buf, &fs_len, "uniform sampler2D uTex1;");
+    if (cc_features.used_masks[0])   append_line(fs_buf, &fs_len, "uniform sampler2D uTexMask0;");
+    if (cc_features.used_masks[1])   append_line(fs_buf, &fs_len, "uniform sampler2D uTexMask1;");
+    if (cc_features.used_blend[0])   append_line(fs_buf, &fs_len, "uniform sampler2D uTexBlend0;");
+    if (cc_features.used_blend[1])   append_line(fs_buf, &fs_len, "uniform sampler2D uTexBlend1;");
+
+    append_line(fs_buf, &fs_len, "uniform int frame_count;");
+    append_line(fs_buf, &fs_len, "uniform float noise_scale;");
+
+    append_line(fs_buf, &fs_len, "float random(in vec3 value) {");
+    append_line(fs_buf, &fs_len, "    float _random = dot(sin(value), vec3(12.9898, 78.233, 37.719));");
+    append_line(fs_buf, &fs_len, "    return fract(sin(_random) * 143758.5453);");
+    append_line(fs_buf, &fs_len, "}");
+
+    if (filter_mode == FILTER_THREE_POINT) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "#define TEX_OFFSET(off) texture(tex, texCoord - (off)/texSize)");
+#else
+        append_line(fs_buf, &fs_len, "#define TEX_OFFSET(off) texture2D(tex, texCoord - (off)/texSize)");
+#endif
+        append_line(fs_buf, &fs_len, "vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize) {");
+        append_line(fs_buf, &fs_len, "    vec2 offset = fract(texCoord*texSize - vec2(0.5));");
+        append_line(fs_buf, &fs_len, "    offset -= step(1.0, offset.x + offset.y);");
+        append_line(fs_buf, &fs_len, "    vec4 c0 = TEX_OFFSET(offset);");
+        append_line(fs_buf, &fs_len, "    vec4 c1 = TEX_OFFSET(vec2(offset.x - sign(offset.x), offset.y));");
+        append_line(fs_buf, &fs_len, "    vec4 c2 = TEX_OFFSET(vec2(offset.x, offset.y - sign(offset.y)));");
+        append_line(fs_buf, &fs_len, "    return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);");
+        append_line(fs_buf, &fs_len, "}");
+        append_line(fs_buf, &fs_len, "vec4 hookTexture2D(in sampler2D tex, in vec2 uv, in vec2 texSize) {");
+        append_line(fs_buf, &fs_len, "    return filter3point(tex, uv, texSize);");
+        append_line(fs_buf, &fs_len, "}");
+    } else {
+        append_line(fs_buf, &fs_len, "vec4 hookTexture2D(in sampler2D tex, in vec2 uv, in vec2 texSize) {");
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "    return texture(tex, uv);");
+#else
+        append_line(fs_buf, &fs_len, "    return texture2D(tex, uv);");
+#endif
+        append_line(fs_buf, &fs_len, "}");
+    }
+
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    append_line(fs_buf, &fs_len, "out vec4 outColor;");
+#endif
+
+    if (srgb_mode) {
+        append_line(fs_buf, &fs_len, "vec4 fromLinear(vec4 linearRGB){");
+        append_line(fs_buf, &fs_len, "    bvec3 cutoff = lessThan(linearRGB.rgb, vec3(0.0031308));");
+        append_line(fs_buf, &fs_len, "    vec3 higher = vec3(1.055)*pow(linearRGB.rgb, vec3(1.0/2.4)) - vec3(0.055);");
+        append_line(fs_buf, &fs_len, "    vec3 lower = linearRGB.rgb * vec3(12.92);");
+        append_line(fs_buf, &fs_len, "    return vec4(mix(higher, lower, cutoff), linearRGB.a);}");
+    }
+
+    append_line(fs_buf, &fs_len, "void main() {");
+    append_line(fs_buf, &fs_len, "#define WRAP(x, low, high) mod((x)-(low), (high)-(low)) + (low)");
+
+    for (int i = 0; i < 2; i++) {
+        if (cc_features.usedTextures[i]) {
+            bool s = cc_features.clamp[i][0], t = cc_features.clamp[i][1];
+#if defined(USE_OPENGLES)
+            fs_len += sprintf(fs_buf + fs_len, "vec2 texSize%d = vec2(textureSize(uTex%d, 0));\n", i, i);
+#else
+            fs_len += sprintf(fs_buf + fs_len, "vec2 texSize%d = textureSize(uTex%d, 0);\n", i, i);
+#endif
+
+            if (!s && !t) {
+                fs_len += sprintf(fs_buf + fs_len, "vec2 vTexCoordAdj%d = vTexCoord%d;\n", i, i);
+            } else if (s && t) {
+                fs_len += sprintf(fs_buf + fs_len,
+                    "vec2 vTexCoordAdj%d = clamp(vTexCoord%d, 0.5 / texSize%d, vec2(vTexClampS%d, vTexClampT%d));\n",
+                    i, i, i, i, i);
+            } else if (s) {
+                fs_len += sprintf(fs_buf + fs_len,
+                    "vec2 vTexCoordAdj%d = vec2(clamp(vTexCoord%d.s, 0.5 / texSize%d.s, vTexClampS%d), vTexCoord%d.t);\n",
+                    i, i, i, i, i);
+            } else {
+                fs_len += sprintf(fs_buf + fs_len,
+                    "vec2 vTexCoordAdj%d = vec2(vTexCoord%d.s, clamp(vTexCoord%d.t, 0.5 / texSize%d.t, vTexClampT%d));\n",
+                    i, i, i, i, i);
+            }
+
+            fs_len += sprintf(fs_buf + fs_len,
+                "vec4 texVal%d = hookTexture2D(uTex%d, vTexCoordAdj%d, texSize%d);\n", i, i, i, i);
+
+            if (cc_features.used_masks[i]) {
+#if defined(USE_OPENGLES)
+                fs_len += sprintf(fs_buf + fs_len, "vec2 maskSize%d = vec2(textureSize(uTexMask%d, 0));\n", i, i);
+#else
+                fs_len += sprintf(fs_buf + fs_len, "vec2 maskSize%d = textureSize(uTexMask%d, 0);\n", i, i);
+#endif
+                fs_len += sprintf(fs_buf + fs_len,
+                    "vec4 maskVal%d = hookTexture2D(uTexMask%d, vTexCoordAdj%d, maskSize%d);\n", i, i, i, i);
+
+                if (cc_features.used_blend[i]) {
+                    fs_len += sprintf(fs_buf + fs_len,
+                        "vec4 blendVal%d = hookTexture2D(uTexBlend%d, vTexCoordAdj%d, texSize%d);\n", i, i, i, i);
+                } else {
+                    fs_len += sprintf(fs_buf + fs_len, "vec4 blendVal%d = vec4(0, 0, 0, 0);\n", i);
+                }
+                fs_len += sprintf(fs_buf + fs_len,
+                    "texVal%d = mix(texVal%d, blendVal%d, maskVal%d.a);\n", i, i, i, i);
+            }
+        }
+    }
+
+    append_line(fs_buf, &fs_len, cc_features.opt_alpha ? "vec4 texel;" : "vec3 texel;");
+
+    for (int c = 0; c < (cc_features.opt_2cyc ? 2 : 1); c++) {
+        if (c == 1) {
+            if (cc_features.opt_alpha) {
+                if (cc_features.c[c][1][2] == SHADER_COMBINED)
+                    append_line(fs_buf, &fs_len, "texel.a = WRAP(texel.a, -1.01, 1.01);");
+                else
+                    append_line(fs_buf, &fs_len, "texel.a = WRAP(texel.a, -0.51, 1.51);");
+            }
+            if (cc_features.c[c][0][2] == SHADER_COMBINED)
+                append_line(fs_buf, &fs_len, "texel.rgb = WRAP(texel.rgb, -1.01, 1.01);");
+            else
+                append_line(fs_buf, &fs_len, "texel.rgb = WRAP(texel.rgb, -0.51, 1.51);");
+        }
+
+        append_str(fs_buf, &fs_len, "texel = ");
+        if (!cc_features.color_alpha_same[c] && cc_features.opt_alpha) {
+            append_str(fs_buf, &fs_len, "vec4(");
+            append_formula(fs_buf, &fs_len, cc_features.c[c],
+                           cc_features.do_single[c][0], cc_features.do_multiply[c][0], cc_features.do_mix[c][0],
+                           false, false, true, c == 0);
+            append_str(fs_buf, &fs_len, ", ");
+            append_formula(fs_buf, &fs_len, cc_features.c[c],
+                           cc_features.do_single[c][1], cc_features.do_multiply[c][1], cc_features.do_mix[c][1],
+                           true, true, true, c == 0);
+            append_str(fs_buf, &fs_len, ")");
+        } else {
+            append_formula(fs_buf, &fs_len, cc_features.c[c],
+                           cc_features.do_single[c][0], cc_features.do_multiply[c][0], cc_features.do_mix[c][0],
+                           cc_features.opt_alpha, false, cc_features.opt_alpha, c == 0);
+        }
+        append_line(fs_buf, &fs_len, ";");
+    }
+
+    append_line(fs_buf, &fs_len, "texel = WRAP(texel, -0.51, 1.51);");
+    append_line(fs_buf, &fs_len, "texel = clamp(texel, 0.0, 1.0);");
+
+    if (cc_features.opt_fog) {
+        if (cc_features.opt_alpha)
+            append_line(fs_buf, &fs_len, "texel = vec4(mix(texel.rgb, vFog.rgb, vFog.a), texel.a);");
+        else
+            append_line(fs_buf, &fs_len, "texel = mix(texel, vFog.rgb, vFog.a);");
+    }
+
+    if (cc_features.opt_texture_edge && cc_features.opt_alpha)
+        append_line(fs_buf, &fs_len, "if (texel.a > 0.19) texel.a = 1.0; else discard;");
+
+    if (cc_features.opt_alpha && cc_features.opt_noise)
+        append_line(fs_buf, &fs_len,
+            "texel.a *= floor(clamp(random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + texel.a, 0.0, 1.0));");
+
+    if (cc_features.opt_grayscale) {
+        append_line(fs_buf, &fs_len, "float intensity = (texel.r + texel.g + texel.b) / 3.0;");
+        append_line(fs_buf, &fs_len, "vec3 new_texel = vGrayscaleColor.rgb * intensity;");
+        append_line(fs_buf, &fs_len, "texel.rgb = mix(texel.rgb, new_texel, vGrayscaleColor.a);");
+    }
+
+    if (cc_features.opt_alpha) {
+        if (cc_features.opt_alpha_threshold)
+            append_line(fs_buf, &fs_len, "if (texel.a < 8.0 / 256.0) discard;");
+        if (cc_features.opt_invisible)
+            append_line(fs_buf, &fs_len, "texel.a = 0.0;");
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "outColor = texel;");
+#else
+        append_line(fs_buf, &fs_len, "gl_FragColor = texel;");
+#endif
+    } else {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "outColor = vec4(texel, 1.0);");
+#else
+        append_line(fs_buf, &fs_len, "gl_FragColor = vec4(texel, 1.0);");
+#endif
+    }
+
+    if (srgb_mode) {
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+        append_line(fs_buf, &fs_len, "outColor = fromLinear(outColor);");
+#else
+        append_line(fs_buf, &fs_len, "gl_FragColor = fromLinear(gl_FragColor);");
+#endif
+    }
+
+    append_line(fs_buf, &fs_len, "}");
+
+    fs_buf[fs_len] = '\0';
+    return std::string(fs_buf, fs_len);
+}
+
+void GfxRenderingAPIOGL::ClearShaderCache() {
 }
 
 ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
-    const auto fs_buf = BuildFsShader(cc_features);
-    const auto vs_buf = BuildVsShader(cc_features);
+
+    size_t num_floats = 0;
+    const std::string vs_buf = BuildVsShaderInline(cc_features, num_floats);
+    const std::string fs_buf = BuildFsShaderInline(cc_features, mCurrentFilterMode, mSrgbMode);
+
     const GLchar* sources[2] = { vs_buf.data(), fs_buf.data() };
-    const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
+    const GLint  lengths[2]  = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
     GLint success;
 
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
-    glCompileShader(vertex_shader);
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        // fprintf(stderr, "Vertex shader compilation failed\n");
-        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
-        // fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
+#ifdef __vita__
+    GLuint shader_program = 0;
+    int prog_size = 0, prog_len = 0;
+    unsigned int prog_format = 0;
+    void* prog_bin = nullptr;
+    char fname[256];
+    sprintf(fname, "ux0:data/ghostship/shader_cache/%016llX_%016llX_%d.bin", shader_id1, shader_id0, SHADER_MAGIC);
+    FILE* f = fopen(fname, "rb");
+    if (f) {
+        shader_program = glCreateProgram();
+        fseek(f, 0, SEEK_END);
+        int file_size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        prog_bin = malloc(file_size - sizeof(size_t));
+        fread(&num_floats, 1, sizeof(size_t), f);
+        fread(prog_bin, 1, file_size - sizeof(size_t), f);
+        fclose(f);
+        glProgramBinary(shader_program, 0, prog_bin, file_size - sizeof(size_t));
+        free(prog_bin);
+        goto program_ready;
+    }
+#endif
+
+    {
+        GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
+        glCompileShader(vertex_shader);
+        glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            GLint max_length = 0;
+            glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
+            char error_log[1024];
+            glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
+            fprintf(stderr, "Vertex shader compilation failed:\n%s\n", error_log);
+            abort();
+        }
+
+        GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
+        glCompileShader(fragment_shader);
+        glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            GLint max_length = 0;
+            glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
+            char error_log[1024];
+            glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
+            fprintf(stderr, "Fragment shader compilation failed:\n%s\n", error_log);
+            abort();
+        }
+
+#ifdef __vita__
+        shader_program = glCreateProgram();
+#else
+        GLuint shader_program = glCreateProgram();
+#endif
+        glAttachShader(shader_program, vertex_shader);
+        glAttachShader(shader_program, fragment_shader);
+        glLinkProgram(shader_program);
+
+#ifdef __vita__
+        f = fopen(fname, "wb");
+        if (f) {
+            glGetProgramiv(shader_program, GL_PROGRAM_BINARY_LENGTH, &prog_size);
+            prog_bin = malloc(prog_size);
+            glGetProgramBinary(shader_program, prog_size, &prog_len, &prog_format, prog_bin);
+            fwrite(&num_floats, 1, sizeof(size_t), f);
+            fwrite(prog_bin, 1, prog_len, f);
+            fclose(f);
+            free(prog_bin);
+        }
     }
 
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
-    glCompileShader(fragment_shader);
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        fprintf(stderr, "Fragment shader compilation failed\n");
-        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
-        fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
+program_ready:
+#else
     }
-
-    GLuint shader_program = glCreateProgram();
-    glAttachShader(shader_program, vertex_shader);
-    glAttachShader(shader_program, fragment_shader);
-    glLinkProgram(shader_program);
+#endif
 
     size_t cnt = 0;
 
@@ -502,14 +725,15 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->usedTextures[3] = cc_features.used_masks[1];
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
-    prg->numFloats = numFloats;
+    prg->numFloats = num_floats;
     prg->numAttribs = cnt;
 
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
-    prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
-    prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
-    prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
+
+    prg->texture_width_location     = -1;
+    prg->texture_height_location    = -1;
+    prg->texture_filtering_location = -1;
 
     LoadShader(prg);
 
@@ -555,7 +779,6 @@ void GfxRenderingAPIOGL::ShaderGetInfo(struct ShaderProgram* prg, uint8_t* numIn
 GLuint GfxRenderingAPIOGL::NewTexture() {
     GLuint ret;
     glGenTextures(1, &ret);
-    textures.resize(std::max(textures.size(), (size_t)ret + 1));
     return ret;
 }
 
@@ -577,9 +800,10 @@ void GfxRenderingAPIOGL::SelectTexture(int tile, GLuint texture_id) {
 }
 
 void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
-    textures[mCurrentTextureIds[mCurrentTile]].width = width;
-    textures[mCurrentTextureIds[mCurrentTile]].height = height;
 }
 
 #ifdef USE_OPENGLES
@@ -608,7 +832,6 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     const GLint filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    textures[mCurrentTextureIds[tile]].filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl(cms));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gfx_cm_to_opengl(cmt));
 }
@@ -616,6 +839,13 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
 void GfxRenderingAPIOGL::SetDepthTestAndMask(bool depth_test, bool z_upd) {
     mCurrentDepthTest = depth_test;
     mCurrentDepthMask = z_upd;
+}
+
+void GfxRenderingAPIOGL::SetCurrentPrimDepth(float depth) {
+    if (depth != mCurrentPrimDepth) {
+        mCurrentPrimDepth = depth;
+        mPrimDepthDirty = true;
+    }
 }
 
 void GfxRenderingAPIOGL::SetZmodeDecal(bool zmode_decal) {
@@ -642,6 +872,9 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
     }
 }
 
+// SSB64 port: draw-dump debug feature (see port/gameloop.cpp SSB64_DUMP_DRAWS).
+// Armed externally; writes a numbered snapshot of the current draw target on
+// every DrawTriangles call so a corrupt frame can be bisected to the exact draw.
 extern "C" int gPortGLDumpDraws;
 static void GLDumpDrawSnapshot();
 static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats);
@@ -698,8 +931,11 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 
     SetPerDrawUniforms();
 
-    // printf("flushing %d tris\n", buf_vbo_num_tris);
+#ifdef __vita__
+    vglBufferData(GL_ARRAY_BUFFER, buf_vbo);
+#else
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
+#endif
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
     if (gPortGLDumpDraws) {
         GLDumpDrawVbo(buf_vbo, buf_vbo_len, buf_vbo_num_tris,
@@ -709,19 +945,19 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 }
 
 void GfxRenderingAPIOGL::Init() {
-#if !defined(__linux__) && !defined(__OpenBSD__)
+#if !defined(__linux__) && !defined(__vita__) && !defined(__OpenBSD__)
     glewInit();
 #endif
 
     glGenBuffers(1, &mOpenglVbo);
     glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
 
-#if defined(__APPLE__) || defined(USE_OPENGLES)
+#if defined(__APPLE__) || (defined(USE_OPENGLES) && !defined(__vita__))
     glGenVertexArrays(1, &mOpenglVao);
     glBindVertexArray(mOpenglVao);
 #endif
 
-#ifndef USE_OPENGLES // not supported on gles
+#if !defined(USE_OPENGLES) && !defined(__vita__)
     glEnable(GL_DEPTH_CLAMP);
 #endif
     glDepthFunc(GL_LEQUAL);
@@ -740,15 +976,14 @@ void GfxRenderingAPIOGL::Init() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     mPixelDepthRbSize = 1;
-
+#ifdef __vita__
+    mMaxMsaaLevel = 1;
+#else
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
+#endif
 }
 
 void GfxRenderingAPIOGL::OnResize() {
-}
-
-void GfxRenderingAPIOGL::StartFrame() {
-    mFrameCount++;
 }
 
 // --------------------------------------------------------------------------
@@ -804,12 +1039,21 @@ static void GLCaptureBackbufferNow(const char* path) {
     }
 }
 
+void GfxRenderingAPIOGL::StartFrame() {
+    mFrameCount++;
+}
+
 void GfxRenderingAPIOGL::EndFrame() {
     if (sGLCapturePending) {
         sGLCapturePending = false;
         GLCaptureBackbufferNow(sGLCapturePendingPath);
     }
+#ifndef __vita__
     glFlush();
+#endif
+}
+
+void GfxRenderingAPIOGL::FinishRender() {
 }
 
 // Per-draw framebuffer dump (debug): when gPortGLDumpDraws is nonzero, every
@@ -906,9 +1150,6 @@ static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, 
     fflush(sVboLog);
 }
 
-void GfxRenderingAPIOGL::FinishRender() {
-}
-
 int GfxRenderingAPIOGL::CreateFramebuffer() {
     GLuint clrbuf;
     glGenTextures(1, &clrbuf);
@@ -917,21 +1158,6 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glBindTexture(GL_TEXTURE_2D, 0);
-
-    // Register clrbuf in `textures` so SelectTextureFb-bound FB samples have
-    // populated width/height entries. SetPerDrawUniforms reads
-    // textures[mCurrentTextureIds[0]].{width,height} into the shader's
-    // texture_width/texture_height uniforms; without this, the GLSL fragment
-    // shader's `clamp(vTexCoord, 0.5/texSize, ...)` divides by zero whenever
-    // an FB-passthrough draw uses the clamp path (1P stage-clear stripes,
-    // VS results photo wipe), producing NaN sample coords and a black/hung
-    // sample on every GL driver. D3D11 sets tex.width/height in its
-    // UpdateFramebufferParameters; Metal queries texture.get_width() in its
-    // shader, so neither needs this.
-    textures.resize(std::max(textures.size(), (size_t)clrbuf + 1));
-    textures[clrbuf].width = 1;
-    textures[clrbuf].height = 1;
-    textures[clrbuf].filtering = FILTER_LINEAR;
 
     GLuint clrbufMsaa;
     glGenRenderbuffers(1, &clrbufMsaa);
@@ -956,43 +1182,6 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     return i;
 }
 
-void GfxRenderingAPIOGL::DestroyFramebuffer(int fbId) {
-    if (fbId < 0 || (size_t)fbId >= mFrameBuffers.size()) {
-        return;
-    }
-    FramebufferOGL& fb = mFrameBuffers[fbId];
-    if (fb.fbo == 0 && fb.clrbuf == 0 && fb.clrbufMsaa == 0 && fb.rbo == 0) {
-        return; // Already destroyed.
-    }
-    if (fb.fbo != 0) {
-        glDeleteFramebuffers(1, &fb.fbo);
-    }
-    if (fb.clrbuf != 0) {
-        glDeleteTextures(1, &fb.clrbuf);
-        // Drop the matching entry in our textures table; SelectTextureFb
-        // never references this id again because the chain releases the
-        // FBO before it could be sampled.
-        if ((size_t)fb.clrbuf < textures.size()) {
-            textures[fb.clrbuf].width = 0;
-            textures[fb.clrbuf].height = 0;
-        }
-    }
-    if (fb.clrbufMsaa != 0) {
-        glDeleteRenderbuffers(1, &fb.clrbufMsaa);
-    }
-    if (fb.rbo != 0) {
-        glDeleteRenderbuffers(1, &fb.rbo);
-    }
-    fb.fbo = 0;
-    fb.clrbuf = 0;
-    fb.clrbufMsaa = 0;
-    fb.rbo = 0;
-    fb.width = 0;
-    fb.height = 0;
-    fb.has_depth_buffer = false;
-    fb.msaa_level = 0;
-}
-
 void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                      bool can_extract_depth) {
@@ -1000,48 +1189,29 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
 
     width = std::max(width, 1U);
     height = std::max(height, 1U);
+#ifdef __vita__
+    msaa_level = 1;
+#else
     msaa_level = std::min(msaa_level, (uint32_t)mMaxMsaaLevel);
+#endif
 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
     if (fb_id != 0) {
-        // Post-process intermediates may have switched format (sRGB or
-        // float). When that happens the color attachment must be
-        // reallocated even if size/msaa are unchanged.
-        const bool formatChanged = (fb.postProcessFormat != fb.lastPostProcessFormat);
-        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || formatChanged) {
-            GLenum internalFmt = GL_RGB8;
-            GLenum srcFmt = GL_RGB;
-            GLenum srcType = GL_UNSIGNED_BYTE;
-            switch (fb.postProcessFormat) {
-                case PostProcessFboFormat::Default:
-                    internalFmt = GL_RGB8;
-                    srcFmt = GL_RGB;
-                    srcType = GL_UNSIGNED_BYTE;
-                    break;
-                case PostProcessFboFormat::Srgb:
-                    internalFmt = GL_SRGB8_ALPHA8;
-                    srcFmt = GL_RGBA;
-                    srcType = GL_UNSIGNED_BYTE;
-                    break;
-                case PostProcessFboFormat::Float16:
-                    internalFmt = GL_RGBA16F;
-                    srcFmt = GL_RGBA;
-                    srcType = GL_HALF_FLOAT;
-                    break;
-            }
+        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
             if (msaa_level <= 1) {
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-                glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, width, height, 0, srcFmt, srcType, NULL);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
                 glBindTexture(GL_TEXTURE_2D, 0);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
             } else {
+#ifndef __vita__
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, internalFmt, width, height);
+                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
+#endif
             }
-            fb.lastPostProcessFormat = fb.postProcessFormat;
         }
 
         if (has_depth_buffer &&
@@ -1050,7 +1220,9 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
             if (msaa_level <= 1) {
                 glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
             } else {
+#ifndef __vita__
                 glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
+#endif
             }
             glBindRenderbuffer(GL_RENDERBUFFER, 0);
         }
@@ -1067,12 +1239,6 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     fb.has_depth_buffer = has_depth_buffer;
     fb.msaa_level = msaa_level;
     fb.invertY = opengl_invertY;
-
-    // Keep textures[clrbuf] dimensions in sync — see CreateFramebuffer for why.
-    if (fb_id != 0 && fb.clrbuf != 0 && (size_t)fb.clrbuf < textures.size()) {
-        textures[fb.clrbuf].width = (uint16_t)std::min<uint32_t>(width, UINT16_MAX);
-        textures[fb.clrbuf].height = (uint16_t)std::min<uint32_t>(height, UINT16_MAX);
-    }
 }
 
 void GfxRenderingAPIOGL::StartDrawToFramebuffer(int fb_id, float noise_scale) {
@@ -1090,93 +1256,33 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
         mLastScissorEnabled = 0;
         glDisable(GL_SCISSOR_TEST);
     }
-    if (color && !mColorWriteEnabled) {
-        // glClear honors glColorMask; a color clear must not be silently
-        // dropped while a redirect draw has color writes suppressed.
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    }
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
-    if (color && !mColorWriteEnabled) {
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    }
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
         glEnable(GL_SCISSOR_TEST);
     }
 }
 
-void GfxRenderingAPIOGL::SetColorWriteMask(bool enable) {
-    mColorWriteEnabled = enable;
-    glColorMask(enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE,
-                enable ? GL_TRUE : GL_FALSE);
-    // Redirect-to-Z draws (color writes off) also need REAL near/far
-    // clipping: the backend runs with GL_DEPTH_CLAMP enabled globally
-    // (N64-style permissive near behavior for ordinary color draws), but a
-    // depth-mask mesh straddling the camera plane then rasterizes an
-    // inflated unclipped shape and its synthesized-depth writes smear far
-    // beyond the authored mask region — SSB64's intro explosion Overlay
-    // punches its reveal mask over the red outer ring that way. The RSP
-    // clips these tris; matching that requires clipping here too.
-#ifndef USE_OPENGLES // GLES does not expose GL_DEPTH_CLAMP.
-    if (enable) {
-        glEnable(GL_DEPTH_CLAMP);
-    } else {
-        glDisable(GL_DEPTH_CLAMP);
-    }
-#endif
-}
-
-void GfxRenderingAPIOGL::ClearRegionImpl(float x0, float y0, float x1, float y1, bool color, bool depth,
-                                         float depth_value) {
-    const FramebufferOGL& fb = mFrameBuffers[mCurrentFrameBuffer];
-    const int w = (int)fb.width;
-    const int h = (int)fb.height;
-    int px0 = (int)(x0 * w + 0.5f);
-    int px1 = (int)(x1 * w + 0.5f);
-    // Game-space y is top-down; convert to this FB's row convention the same
-    // way GetPixelDepth does.
-    int py_top = (int)(y0 * h + 0.5f);
-    int py_bot = (int)(y1 * h + 0.5f);
-    int gy0 = fb.invertY ? (h - py_bot) : py_top;
-    if (px1 <= px0 || py_bot <= py_top) {
-        return;
-    }
-
+void GfxRenderingAPIOGL::ClearDepthRegion(int x, int y, int w, int h) {
+    // Save current scissor state so callers don't need to manually invalidate.
     GLint prevScissor[4];
+    GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
     glGetIntegerv(GL_SCISSOR_BOX, prevScissor);
-    if (mLastScissorEnabled != 1) {
-        mLastScissorEnabled = 1;
-        glEnable(GL_SCISSOR_TEST);
-    }
-    glScissor(px0, gy0, px1 - px0, py_bot - py_top);
-    if (color && !mColorWriteEnabled) {
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    }
-    glDepthMask(GL_TRUE);
-#ifdef USE_OPENGLES
-    glClearDepthf(depth_value);
-#else
-    glClearDepth((GLdouble)depth_value);
-#endif
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
-#ifdef USE_OPENGLES
-    glClearDepthf(1.0f);
-#else
-    glClearDepth(1.0);
-#endif
-    glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
-    if (color && !mColorWriteEnabled) {
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    }
-    glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
-}
 
-void GfxRenderingAPIOGL::ClearColorRegion(float x0, float y0, float x1, float y1) {
-    ClearRegionImpl(x0, y0, x1, y1, true, false, 1.0f);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x, y, w, h);
+    glDepthMask(GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+
+    // Restore previous scissor state.
+    glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
+    if (!scissorWasEnabled) {
+        glDisable(GL_SCISSOR_TEST);
+    }
 }
 
 void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
@@ -1205,769 +1311,10 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
     return (void*)(uintptr_t)mFrameBuffers[fb_id].clrbuf;
 }
 
-// --- Post-process / user-shader pipeline ----------------------------------
-//
-// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
-// No code copied from RetroArch or any GPL-licensed shader runtime.
-
-static const char kPostProcessVertexShader[] =
-    "#version 330 core\n"
-    "in vec2 aPos;\n"
-    "out vec2 vTexCoord;\n"
-    "uniform int FlipY;\n"
-    "void main() {\n"
-    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
-    "    vec2 uv = aPos * 0.5 + 0.5;\n"
-    "    if (FlipY != 0) uv.y = 1.0 - uv.y;\n"
-    "    vTexCoord = uv;\n"
-    "}\n";
-
-bool GfxRenderingAPIOGL::SupportsPostProcess() {
-    return true;
-}
-
-GLuint GfxRenderingAPIOGL::CompilePostProcessProgram(const std::string& fsSource, std::string& errOut) {
-    auto compile = [&](GLenum type, const char* src) -> GLuint {
-        GLuint sh = glCreateShader(type);
-        glShaderSource(sh, 1, &src, nullptr);
-        glCompileShader(sh);
-        GLint ok = GL_FALSE;
-        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-        if (!ok) {
-            GLint len = 0;
-            glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
-            std::string log(std::max(len, 1) - 1, '\0');
-            if (len > 0) {
-                glGetShaderInfoLog(sh, len, nullptr, log.data());
-            }
-            errOut = std::move(log);
-            glDeleteShader(sh);
-            return 0;
-        }
-        return sh;
-    };
-    GLuint vs = compile(GL_VERTEX_SHADER, kPostProcessVertexShader);
-    if (vs == 0) {
-        return 0;
-    }
-    GLuint fs = compile(GL_FRAGMENT_SHADER, fsSource.c_str());
-    if (fs == 0) {
-        glDeleteShader(vs);
-        return 0;
-    }
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    // Tie the only vertex attribute to slot 0; the FS doesn't have any so
-    // there is no fragment-output binding to worry about (single FS
-    // output is assumed at location 0).
-    glBindAttribLocation(prog, 0, "aPos");
-    glLinkProgram(prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    GLint ok = GL_FALSE;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        GLint len = 0;
-        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
-        std::string log(std::max(len, 1) - 1, '\0');
-        if (len > 0) {
-            glGetProgramInfoLog(prog, len, nullptr, log.data());
-        }
-        errOut = std::move(log);
-        glDeleteProgram(prog);
-        return 0;
-    }
-    return prog;
-}
-
-int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
-    if (src.glsl.empty()) {
-        SPDLOG_ERROR("Post-process shader '{}' has no GLSL source", src.name);
-        return -1;
-    }
-    std::string err;
-    GLuint prog = CompilePostProcessProgram(src.glsl, err);
-    if (prog == 0) {
-        SPDLOG_ERROR("Post-process shader '{}' failed to compile/link: {}", src.name, err);
-        return -1;
-    }
-
-    PostProcessProgramOGL slot{};
-    slot.program = prog;
-    slot.name = src.name;
-    slot.sourceLocation = glGetUniformLocation(prog, "Source");
-    slot.sourceSizeLocation = glGetUniformLocation(prog, "SourceSize");
-    slot.outputSizeLocation = glGetUniformLocation(prog, "OutputSize");
-    slot.inputSizeLocation = glGetUniformLocation(prog, "InputSize");
-    slot.originalLocation = glGetUniformLocation(prog, "Original");
-    slot.originalSizeLocation = glGetUniformLocation(prog, "OriginalSize");
-    slot.frameCountLocation = glGetUniformLocation(prog, "FrameCount");
-    slot.frameDirectionLocation = glGetUniformLocation(prog, "FrameDirection");
-    slot.aliasLocations.reserve(src.aliasNames.size());
-    slot.aliasSizeLocations.reserve(src.aliasNames.size());
-    for (const std::string& alias : src.aliasNames) {
-        slot.aliasLocations.push_back(glGetUniformLocation(prog, alias.c_str()));
-        const std::string sizeName = alias + "Size";
-        slot.aliasSizeLocations.push_back(glGetUniformLocation(prog, sizeName.c_str()));
-    }
-
-    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
-        if (mPostProcessPrograms[i].program == 0) {
-            mPostProcessPrograms[i] = std::move(slot);
-            return (int)i;
-        }
-    }
-    mPostProcessPrograms.push_back(std::move(slot));
-    return (int)(mPostProcessPrograms.size() - 1);
-}
-
-void GfxRenderingAPIOGL::DestroyPostProcessProgram(int progId) {
-    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
-        return;
-    }
-    auto& slot = mPostProcessPrograms[progId];
-    if (slot.program != 0) {
-        glDeleteProgram(slot.program);
-        slot = PostProcessProgramOGL{};
-    }
-}
-
-// Phase 3D-1: compile a slang program (authored VS + FS) and pre-
-// allocate its UBO. Sampler texture units are pinned at link time via
-// glUniform1i so the run path (Phase 3D-2) only needs to bind
-// textures, not re-poke uniform values. The legacy LUS-schema path
-// (CreatePostProcessProgram) is untouched.
-int GfxRenderingAPIOGL::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
-    if (src.vsGlsl.empty() || src.fsGlsl.empty()) {
-        SPDLOG_ERROR("Slang post-process shader '{}' missing VS or FS GLSL", src.name);
-        return -1;
-    }
-
-    auto compile = [&](GLenum type, const char* source) -> GLuint {
-        GLuint sh = glCreateShader(type);
-        glShaderSource(sh, 1, &source, nullptr);
-        glCompileShader(sh);
-        GLint ok = GL_FALSE;
-        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-        if (!ok) {
-            GLint len = 0;
-            glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
-            std::string log(std::max(len, 1) - 1, '\0');
-            if (len > 0) {
-                glGetShaderInfoLog(sh, len, nullptr, log.data());
-            }
-            SPDLOG_ERROR("Slang post-process shader '{}' {} compile failed: {}",
-                         src.name,
-                         (type == GL_VERTEX_SHADER) ? "vertex" : "fragment",
-                         log);
-            glDeleteShader(sh);
-            return 0;
-        }
-        return sh;
-    };
-
-    GLuint vs = compile(GL_VERTEX_SHADER, src.vsGlsl.c_str());
-    if (vs == 0) {
-        return -1;
-    }
-    GLuint fs = compile(GL_FRAGMENT_SHADER, src.fsGlsl.c_str());
-    if (fs == 0) {
-        glDeleteShader(vs);
-        return -1;
-    }
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    // Slang vertex stages declare attributes via `layout(location=N)
-    // in ...;` so we let GLSL's explicit-attrib-location handling
-    // bind them; no glBindAttribLocation needed.
-    glLinkProgram(prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    GLint linked = GL_FALSE;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    if (!linked) {
-        GLint len = 0;
-        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
-        std::string log(std::max(len, 1) - 1, '\0');
-        if (len > 0) {
-            glGetProgramInfoLog(prog, len, nullptr, log.data());
-        }
-        SPDLOG_ERROR("Slang post-process shader '{}' link failed: {}", src.name, log);
-        glDeleteProgram(prog);
-        return -1;
-    }
-
-    // Pin each sampler uniform to texture unit i in declaration order.
-    // The slang shader's GLSL declarations had their binding= and
-    // descriptor-set= decorations stripped during transpile, so unit
-    // assignment lives at the program level (here) and the Run path
-    // only needs glActiveTexture(GL_TEXTURE0 + i) + glBindTexture.
-    glUseProgram(prog);
-    for (size_t i = 0; i < src.samplerNames.size(); ++i) {
-        const GLint loc = glGetUniformLocation(prog, src.samplerNames[i].c_str());
-        if (loc >= 0) {
-            glUniform1i(loc, static_cast<GLint>(i));
-        }
-        // Missing samplers (loc == -1) are fine — the driver optimised
-        // the binding out because the shader never sampled it. The run
-        // path can still bind a texture at the unit; it's just unused.
-    }
-    glUseProgram(0);
-
-    // Bind the UBO (named "UBO" by slang convention) to binding point 0
-    // on this program and allocate a dedicated buffer of the declared
-    // size. The Run path memcpys frame data here and reuses the same
-    // glBuffer every frame.
-    const GLuint uboBindingPoint = 0;
-    GLuint ubo = 0;
-    if (src.uboBytes > 0) {
-        const GLuint blockIdx = glGetUniformBlockIndex(prog, "UBO");
-        if (blockIdx != GL_INVALID_INDEX) {
-            glUniformBlockBinding(prog, blockIdx, uboBindingPoint);
-        }
-        glGenBuffers(1, &ubo);
-        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
-        glBufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(src.uboBytes),
-                     nullptr, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_UNIFORM_BUFFER, 0);
-    }
-
-    PostProcessSlangProgramOGL slot{};
-    slot.program = prog;
-    slot.name = src.name;
-    slot.ubo = ubo;
-    slot.uboBytes = src.uboBytes;
-    slot.uboBindingPoint = uboBindingPoint;
-    slot.samplerNames = src.samplerNames;
-
-    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
-        if (mPostProcessSlangPrograms[i].program == 0) {
-            mPostProcessSlangPrograms[i] = std::move(slot);
-            return static_cast<int>(i);
-        }
-    }
-    mPostProcessSlangPrograms.push_back(std::move(slot));
-    return static_cast<int>(mPostProcessSlangPrograms.size() - 1);
-}
-
-void GfxRenderingAPIOGL::DestroyPostProcessSlangProgram(int progId) {
-    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
-        return;
-    }
-    auto& slot = mPostProcessSlangPrograms[progId];
-    if (slot.program != 0) {
-        glDeleteProgram(slot.program);
-    }
-    if (slot.ubo != 0) {
-        glDeleteBuffers(1, &slot.ubo);
-    }
-    slot = PostProcessSlangProgramOGL{};
-}
-
-GLuint GfxRenderingAPIOGL::EnsurePostProcessSlangVao() {
-    if (mPostProcessSlangVao != 0 && mPostProcessSlangVbo != 0) {
-        return mPostProcessSlangVao;
-    }
-    // Fullscreen triangle for slang: vec4 Position (clip space) +
-    // vec2 TexCoord (covers [0,1] after the rasterizer interpolates).
-    // The slang VS multiplies Position by an identity MVP (provided
-    // by the chain), so the vertices land in clip space directly.
-    static const GLfloat kSlangVerts[] = {
-        // Position (xyzw)            // TexCoord (uv)
-        -1.0f, -1.0f, 0.0f, 1.0f,     0.0f, 0.0f,
-         3.0f, -1.0f, 0.0f, 1.0f,     2.0f, 0.0f,
-        -1.0f,  3.0f, 0.0f, 1.0f,     0.0f, 2.0f,
-    };
-    glGenVertexArrays(1, &mPostProcessSlangVao);
-    glBindVertexArray(mPostProcessSlangVao);
-    glGenBuffers(1, &mPostProcessSlangVbo);
-    glBindBuffer(GL_ARRAY_BUFFER, mPostProcessSlangVbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(kSlangVerts), kSlangVerts, GL_STATIC_DRAW);
-    // location 0 = vec4 Position.
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
-                          reinterpret_cast<void*>(0));
-    // location 1 = vec2 TexCoord.
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
-                          reinterpret_cast<void*>(4 * sizeof(GLfloat)));
-    return mPostProcessSlangVao;
-}
-
-void GfxRenderingAPIOGL::RunPostProcessSlang(int progId, int dstFb,
-                                             const uint8_t* uboData, uint32_t uboBytes,
-                                             const int* samplerFbIds, uint32_t samplerCount,
-                                             const PostProcessParams& params) {
-    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
-        return;
-    }
-    const PostProcessSlangProgramOGL& slot = mPostProcessSlangPrograms[progId];
-    if (slot.program == 0) {
-        return;
-    }
-    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
-        return;
-    }
-    const FramebufferOGL& dstFbInfo = mFrameBuffers[dstFb];
-    if (dstFbInfo.fbo == 0) {
-        return;
-    }
-
-    // Fixed-function state: identical to the legacy post-process
-    // path. Mirrors the cache-invalidation pattern so the next
-    // regular draw sees consistent state.
-    if (mLastScissorEnabled != 0) {
-        glDisable(GL_SCISSOR_TEST);
-        mLastScissorEnabled = 0;
-    }
-    if (mLastBlendEnabled != 0) {
-        glDisable(GL_BLEND);
-        mLastBlendEnabled = 0;
-    }
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    mLastDepthTest = -1;
-    mLastDepthMask = -1;
-    mLastZmodeDecal = -1;
-
-    glBindFramebuffer(GL_FRAMEBUFFER, dstFbInfo.fbo);
-    mCurrentFrameBuffer = dstFb;
-    glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-#ifndef USE_OPENGLES // GLES has no GL_FRAMEBUFFER_SRGB toggle — sRGB encode is implicit when the attachment is sRGB-formatted.
-    if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
-        glEnable(GL_FRAMEBUFFER_SRGB);
-    }
-#endif
-
-    // Upload the chain-built UBO blob. The buffer was allocated at
-    // CreatePostProcessSlangProgram time so we just refill.
-    if (slot.ubo != 0 && uboData != nullptr && uboBytes > 0) {
-        glBindBuffer(GL_UNIFORM_BUFFER, slot.ubo);
-        const GLsizeiptr writeBytes =
-            static_cast<GLsizeiptr>(std::min<uint32_t>(uboBytes, slot.uboBytes));
-        glBufferSubData(GL_UNIFORM_BUFFER, 0, writeBytes, uboData);
-        glBindBufferBase(GL_UNIFORM_BUFFER, slot.uboBindingPoint, slot.ubo);
-    }
-
-    // Bind sampler textures in declaration order. Each entry's
-    // samplerFbIds[i] is the FBO whose color texture goes on unit i.
-    // -1 means "use a fallback" — we pick TU0's source if available,
-    // else leave whatever was bound.
-    GLuint fallbackTex = 0;
-    if (samplerCount > 0 && samplerFbIds != nullptr && samplerFbIds[0] >= 0 &&
-        (size_t)samplerFbIds[0] < mFrameBuffers.size()) {
-        fallbackTex = mFrameBuffers[samplerFbIds[0]].clrbuf;
-    }
-    for (uint32_t i = 0; i < samplerCount; ++i) {
-        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
-        GLuint tex = fallbackTex;
-        if (fbId >= 0 && (size_t)fbId < mFrameBuffers.size() &&
-            mFrameBuffers[fbId].clrbuf != 0) {
-            tex = mFrameBuffers[fbId].clrbuf;
-        }
-        if (tex == 0) {
-            continue;
-        }
-        glActiveTexture(GL_TEXTURE0 + i);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        // Phase 3D-2 minimal sampler state: linear / clamp-to-edge on
-        // every slot. Per-slot libretro filter_linearN / wrap_modeN
-        // routing comes with Phase 3D-3 multipass.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        params.srcFilterLinear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                        params.srcFilterLinear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        if (i < SHADER_MAX_TEXTURES) {
-            mLastBoundTextures[i] = tex;
-        }
-    }
-    glActiveTexture(GL_TEXTURE0);
-    mLastActiveTexture = 0;
-
-    glUseProgram(slot.program);
-    mLastLoadedShader = nullptr;
-
-    EnsurePostProcessSlangVao();
-    glBindVertexArray(mPostProcessSlangVao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    // Restore the regular-draw VAO/VBO bindings.
-#if defined(__APPLE__) || defined(USE_OPENGLES)
-    glBindVertexArray(mOpenglVao);
-#else
-    glBindVertexArray(0);
-#endif
-    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
-}
-
-GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
-    if (mPostProcessVao != 0 && mPostProcessVbo != 0) {
-        return mPostProcessVao;
-    }
-    // Fullscreen triangle in NDC. Extends past the [-1,1] viewport on two
-    // edges so a single triangle covers the entire output without the
-    // diagonal seam of a two-triangle quad.
-    static const GLfloat kFullscreenTriangle[] = {
-        -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f,
-    };
-    glGenVertexArrays(1, &mPostProcessVao);
-    glBindVertexArray(mPostProcessVao);
-    glGenBuffers(1, &mPostProcessVbo);
-    glBindBuffer(GL_ARRAY_BUFFER, mPostProcessVbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(kFullscreenTriangle), kFullscreenTriangle, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(GLfloat), (void*)0);
-    return mPostProcessVao;
-}
-
-int GfxRenderingAPIOGL::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
-                                                       const uint8_t* rgba8) {
-    if (width == 0 || height == 0 || rgba8 == nullptr) {
-        return -1;
-    }
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    if (tex == 0) {
-        return -1;
-    }
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, rgba8);
-    // Sampler state is set per RunPostProcess call from the per-binding
-    // filterLinear / wrapMode — leave the texture object defaults here.
-    glBindTexture(GL_TEXTURE_2D, 0);
-    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
-        if (mPostProcessStaticTextures[i] == 0) {
-            mPostProcessStaticTextures[i] = tex;
-            return (int)i;
-        }
-    }
-    mPostProcessStaticTextures.push_back(tex);
-    return (int)(mPostProcessStaticTextures.size() - 1);
-}
-
-void GfxRenderingAPIOGL::DestroyPostProcessStaticTexture(int textureId) {
-    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
-        return;
-    }
-    GLuint& slot = mPostProcessStaticTextures[textureId];
-    if (slot != 0) {
-        glDeleteTextures(1, &slot);
-        slot = 0;
-    }
-}
-
-void GfxRenderingAPIOGL::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
-    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
-        return;
-    }
-    mFrameBuffers[fb_id].postProcessMipmapped = mipmapped;
-}
-
-void GfxRenderingAPIOGL::GeneratePostProcessMipmaps(int fb_id) {
-    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
-        return;
-    }
-    const FramebufferOGL& fb = mFrameBuffers[fb_id];
-    if (fb.clrbuf == 0) {
-        return;
-    }
-    // OpenGL textures allocated via glTexImage2D are mutable; the
-    // first glGenerateMipmap call also reserves storage for levels
-    // 1..N, so the FBO does not need to be pre-allocated as
-    // mipmapped. Set the min filter to MIPMAP_LINEAR on the
-    // implicit texture object so the call is mipmap-complete; the
-    // per-call sampler override in RunPostProcess restores whatever
-    // filter the next bind needs.
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glGenerateMipmap(GL_TEXTURE_2D);
-    // Restore the cached binding so the next regular draw's
-    // texture-bind cache stays accurate. mLastBoundTextures[0] is
-    // whatever the chain or main pass set last; clearing it forces
-    // the next SelectTexture to re-bind.
-    mLastBoundTextures[0] = 0;
-}
-
-void GfxRenderingAPIOGL::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
-    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
-        return;
-    }
-    // Record the desired format; the next UpdateFramebufferParameters
-    // notices the mismatch against lastPostProcessFormat and reallocates
-    // the color attachment.
-    mFrameBuffers[fb_id].postProcessFormat = fmt;
-}
-
-void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
-                                        const PostProcessParams& params) {
-    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
-        return;
-    }
-    const PostProcessProgramOGL& slot = mPostProcessPrograms[progId];
-    if (slot.program == 0) {
-        return;
-    }
-    if (srcFb < 0 || (size_t)srcFb >= mFrameBuffers.size()) {
-        return;
-    }
-    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
-        return;
-    }
-    const FramebufferOGL& srcFbInfo = mFrameBuffers[srcFb];
-    const FramebufferOGL& dstFbInfo = mFrameBuffers[dstFb];
-    if (srcFbInfo.clrbuf == 0 || dstFbInfo.fbo == 0) {
-        return;
-    }
-
-    // Fixed-function state for a fullscreen pass. No scissor, no depth,
-    // no blend. The next regular draw resets viewport / blend / depth.
-    if (mLastScissorEnabled != 0) {
-        glDisable(GL_SCISSOR_TEST);
-        mLastScissorEnabled = 0;
-    }
-    if (mLastBlendEnabled != 0) {
-        glDisable(GL_BLEND);
-        mLastBlendEnabled = 0;
-    }
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    mLastDepthTest = -1;
-    mLastDepthMask = -1;
-    mLastZmodeDecal = -1;
-
-    glBindFramebuffer(GL_FRAMEBUFFER, dstFbInfo.fbo);
-    mCurrentFrameBuffer = dstFb;
-    glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    // sRGB intermediate FBOs need GL_FRAMEBUFFER_SRGB enabled so the
-    // hardware encodes the fragment's linear output back to sRGB on
-    // write. For non-sRGB destinations the state is ignored by spec
-    // (encoding only happens when the attachment is sRGB-formatted),
-    // so we leave it enabled afterwards rather than thrashing state.
-    // GLES has no equivalent toggle — sRGB encode is implicit when the
-    // attachment is sRGB-formatted, so the call is unneeded there.
-#ifndef USE_OPENGLES
-    if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
-        glEnable(GL_FRAMEBUFFER_SRGB);
-    }
-#endif
-
-    // Sample source FB's color texture on TU0. Filter + wrap mode come
-    // from the producer pass's libretro `filter_linearN` / `wrap_modeN`
-    // — passed through PostProcessParams by the chain. Pass 0 sees the
-    // chain's defaults (linear / clamp-to-edge).
-    // Phase 2.2: pick a mipmap-aware min filter when the chain has
-    // pre-populated this pass's input texture with a mip chain via
-    // GeneratePostProcessMipmaps. Mag is single-level by construction.
-    GLint srcMinFilter = params.srcFilterLinear ? GL_LINEAR : GL_NEAREST;
-    GLint srcMagFilter = srcMinFilter;
-    if (params.srcUseMipmap) {
-        srcMinFilter = params.srcFilterLinear ? GL_LINEAR_MIPMAP_LINEAR
-                                              : GL_NEAREST_MIPMAP_NEAREST;
-    }
-    GLint srcWrap = GL_CLAMP_TO_EDGE;
-    switch (params.srcWrapMode) {
-        case PostProcessWrapMode::ClampToEdge:    srcWrap = GL_CLAMP_TO_EDGE; break;
-        case PostProcessWrapMode::ClampToBorder:
-#ifdef USE_OPENGLES
-            // GLES core has no CLAMP_TO_BORDER (3.2 added it as an ext but
-            // we can't assume coverage). Fall back to edge clamp — shaders
-            // that depend on the transparent-black border behaviour will
-            // see edge-sampling artifacts but the pass still renders.
-            srcWrap = GL_CLAMP_TO_EDGE;
-#else
-            srcWrap = GL_CLAMP_TO_BORDER;
-#endif
-            break;
-        case PostProcessWrapMode::Repeat:         srcWrap = GL_REPEAT; break;
-        case PostProcessWrapMode::MirroredRepeat: srcWrap = GL_MIRRORED_REPEAT; break;
-    }
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, srcFbInfo.clrbuf);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, srcMinFilter);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, srcMagFilter);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, srcWrap);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, srcWrap);
-    mLastBoundTextures[0] = srcFbInfo.clrbuf;
-
-    // Original (game FB) on TU1 for multipass shaders that combine
-    // post-bloom Source with the pre-bloom Original. We bind it
-    // unconditionally; shaders that don't reference Original simply
-    // ignore the binding.
-    GLuint originalTex = srcFbInfo.clrbuf;
-    if (originalFb >= 0 && (size_t)originalFb < mFrameBuffers.size() &&
-        mFrameBuffers[originalFb].clrbuf != 0) {
-        originalTex = mFrameBuffers[originalFb].clrbuf;
-    }
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, originalTex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    mLastBoundTextures[1] = originalTex;
-
-    // Alias / external-texture bindings at TUs 2+. Each entry's
-    // sampler state comes from the producer pass's libretro
-    // filter_linearN / wrap_modeN. sourceFb == -1 means "producer
-    // pass hasn't run yet at this point in the chain" — bind the
-    // game FB (Original) as a defensive fallback so the shader's
-    // texture() reads something sane rather than a stale slot.
-    auto glWrap = [](PostProcessWrapMode m) -> GLint {
-        switch (m) {
-            case PostProcessWrapMode::ClampToEdge:    return GL_CLAMP_TO_EDGE;
-            case PostProcessWrapMode::ClampToBorder:
-#ifdef USE_OPENGLES
-                return GL_CLAMP_TO_EDGE;
-#else
-                return GL_CLAMP_TO_BORDER;
-#endif
-            case PostProcessWrapMode::Repeat:         return GL_REPEAT;
-            case PostProcessWrapMode::MirroredRepeat: return GL_MIRRORED_REPEAT;
-        }
-        return GL_CLAMP_TO_EDGE;
-    };
-    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
-        const auto& eb = params.extraBindings[i];
-        GLuint tex = originalTex; // defensive fallback
-        if (eb.staticTextureId >= 0 &&
-            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size() &&
-            mPostProcessStaticTextures[eb.staticTextureId] != 0) {
-            tex = mPostProcessStaticTextures[eb.staticTextureId];
-        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size() &&
-                   mFrameBuffers[eb.sourceFb].clrbuf != 0) {
-            tex = mFrameBuffers[eb.sourceFb].clrbuf;
-        }
-        const GLenum unit = GL_TEXTURE2 + (GLenum)i;
-        glActiveTexture(unit);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        const GLint flt = eb.filterLinear ? GL_LINEAR : GL_NEAREST;
-        const GLint wrp = glWrap(eb.wrapMode);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, flt);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, flt);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrp);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrp);
-        if (i < (size_t)SHADER_MAX_TEXTURES) {
-            mLastBoundTextures[i] = tex;
-        }
-    }
-    // Leave the active texture on TU0 so the next regular draw's
-    // glActiveTexture call doesn't have to undo us.
-    glActiveTexture(GL_TEXTURE0);
-    mLastActiveTexture = 0;
-
-    glUseProgram(slot.program);
-    mLastLoadedShader = nullptr; // Force LoadShader to re-glUseProgram next frame.
-    if (slot.sourceLocation >= 0) {
-        glUniform1i(slot.sourceLocation, 0);
-    }
-    if (slot.originalLocation >= 0) {
-        glUniform1i(slot.originalLocation, 1);
-    }
-    for (size_t i = 0; i < slot.aliasLocations.size(); ++i) {
-        if (slot.aliasLocations[i] >= 0) {
-            glUniform1i(slot.aliasLocations[i], (GLint)(2 + i));
-        }
-    }
-    for (size_t i = 0; i < slot.aliasSizeLocations.size(); ++i) {
-        if (slot.aliasSizeLocations[i] < 0) {
-            continue;
-        }
-        float w = 1.0f;
-        float h = 1.0f;
-        if (i < params.extraBindingsCount) {
-            const auto& eb = params.extraBindings[i];
-            w = (float)eb.width;
-            h = (float)eb.height;
-        }
-        glUniform2f(slot.aliasSizeLocations[i], w, h);
-    }
-    if (slot.originalSizeLocation >= 0) {
-        glUniform2f(slot.originalSizeLocation, (float)params.originalWidth,
-                    (float)params.originalHeight);
-    }
-    if (slot.sourceSizeLocation >= 0) {
-        glUniform2f(slot.sourceSizeLocation, (float)params.srcWidth, (float)params.srcHeight);
-    }
-    if (slot.inputSizeLocation >= 0) {
-        glUniform2f(slot.inputSizeLocation, (float)params.inputWidth, (float)params.inputHeight);
-    }
-    if (slot.outputSizeLocation >= 0) {
-        glUniform2f(slot.outputSizeLocation, (float)params.dstWidth, (float)params.dstHeight);
-    }
-    if (slot.frameCountLocation >= 0) {
-        glUniform1i(slot.frameCountLocation, (int)params.frameCount);
-    }
-    if (slot.frameDirectionLocation >= 0) {
-        glUniform1f(slot.frameDirectionLocation, 1.0f);
-    }
-    // FlipY uniform on the vertex shader compensates for the V-axis
-    // mismatch between source FBO sampling and ImGui::Image's default
-    // UV interpretation (which treats V=0 as the top of the displayed
-    // quad). Both mGameFb (rendered with invertY=true, game-top at
-    // pixel-bottom = V=0) and mGameFbMsaaResolved (MSAA-blitted from
-    // mGameFb, same pixel layout) already have game-top at V=0, so
-    // the post-process pass writes them passthrough — bottom vertex
-    // of the fullscreen tri samples V=0 (game-top) and lands at
-    // GL-pixel-bottom of mDstFb, which is V=0 when ImGui samples mDstFb.
-    // Standard-orientation source FBs (V=0 = image-bottom) would need
-    // FlipY=1; none of the inputs the chain currently runs on are of
-    // that flavour, so the uniform is wired to 0.
-    GLint flipYLoc = glGetUniformLocation(slot.program, "FlipY");
-    if (flipYLoc >= 0) {
-        glUniform1i(flipYLoc, 0);
-    }
-
-    EnsurePostProcessVao();
-    glBindVertexArray(mPostProcessVao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    // Restore the driver-visible VAO/VBO bindings the regular draw path
-    // assumes. On Apple / GLES the backend keeps mOpenglVao bound at all
-    // times; elsewhere it uses the default VAO (0) and an always-bound
-    // mOpenglVbo on GL_ARRAY_BUFFER.
-#if defined(__APPLE__) || defined(USE_OPENGLES)
-    glBindVertexArray(mOpenglVao);
-#else
-    glBindVertexArray(0);
-#endif
-    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
-}
-
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
     SelectTexture(tile, mFrameBuffers[fb_id].clrbuf);
-}
-
-bool GfxRenderingAPIOGL::FbNeedsSampleVFlip(int fb_id) {
-    // Empirically: on Linux/NVIDIA OpenGL (driver 595.x), sampling an
-    // invertY=true FBO as a GL_TEXTURE_2D returns rows in the SAME
-    // direction as the rendered Y-negated storage — V=0 already reads
-    // "game top". No flip is needed; applying one renders the
-    // FB-passthrough wallpaper / VS photo-wipe upside-down. D3D11 and
-    // Metal also use the default-false (no Y negation on the render side,
-    // sampling matches storage). Issue #157's original "OpenGL needs a
-    // V-flip" diagnosis turned out platform-specific to a different
-    // driver/OS and didn't hold on Linux NVIDIA. The safer default is no
-    // flip on any backend until a future report identifies one that
-    // genuinely needs it; the fb_id bounds check is kept so the method
-    // remains a safe per-FB hook for that future case.
-    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
-        return false;
-    }
-    return false;
 }
 
 void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
@@ -1997,8 +1344,7 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         glDisable(GL_SCISSOR_TEST);
     }
 
-    // For msaa enabled buffers we can't perform a scaled blit to a simple sample buffer
-    // First do an unscaled blit to a msaa resolved buffer
+#ifndef __vita__
     if (src.height != dst.height && src.width != dst.width && src.msaa_level > 1) {
         // Start with the main buffer (0) as the msaa resolved buffer
         int fb_resolve_id = 0;
@@ -2019,17 +1365,16 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         fb_src_id = fb_resolve_id;
         src = fb_resolve;
     }
+#endif
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
 
-    // The 0 buffer is a double buffer so we need to choose the back to avoid imgui elements
     if (fb_src_id == 0) {
         glReadBuffer(GL_BACK);
     } else {
         glReadBuffer(GL_COLOR_ATTACHMENT0);
     }
-
     glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
@@ -2046,15 +1391,17 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
     if (fb_id >= (int)mFrameBuffers.size()) {
         return;
     }
-
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[fb_id].fbo);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, (void*)rgba16_buf);
+	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, rgba16_buf);
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 }
 
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
 GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
+#ifdef __vita__
+    return res;
+#endif
 
     FramebufferOGL& fb = mFrameBuffers[fb_id];
 
@@ -2065,7 +1412,7 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
         int x = coordinates.begin()->first;
         int y = coordinates.begin()->second;
-#ifndef USE_OPENGLES // not supported on gles. Runs fine without it, but this may cause issues
+#if !defined(USE_OPENGLES) && !defined(__vita__)
         glReadPixels(x, fb.invertY ? fb.height - y : y, 1, 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8,
                      &depth_stencil_value);
 #endif
@@ -2105,7 +1452,7 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, mPixelDepthFb);
         std::vector<uint32_t> depth_stencil_values(coordinates.size());
-#ifndef USE_OPENGLES // not supported on gles. Runs fine without it, but this may cause issues
+#if !defined(USE_OPENGLES) && !defined(__vita__)
         glReadPixels(0, 0, coordinates.size(), 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, depth_stencil_values.data());
 #endif
         {
@@ -2122,6 +1469,10 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
 }
 
 void GfxRenderingAPIOGL::SetTextureFilter(FilteringMode mode) {
+#ifdef __vita__
+    if (mode == FILTER_THREE_POINT)
+        mode = FILTER_LINEAR;
+#endif
     gfx_texture_cache_clear();
     mCurrentFilterMode = mode;
 }
