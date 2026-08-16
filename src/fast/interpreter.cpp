@@ -308,6 +308,13 @@ bool gfxPointerInLoadedModule(const void* ptr) {
     // leftover (0x01000000, 0x0E000000, ...) would land "inside a module"
     // and the SETTIMG/G_VTX guards would never fire.
     return mod != nullptr && mod != GetModuleHandleA(nullptr);
+#elif defined(__vita__)
+    // Vita has no dlopen()'d mod .so's (DISABLE_SCRIPTING excludes the
+    // funchook-based mod system entirely) and no dladdr()/dlfcn.h, so
+    // "is this pointer inside a dynamically loaded module" is trivially
+    // false - matches what dladdr() failing would already return below
+    // on the POSIX path.
+    return false;
 #else
     // Same main-image exclusion as Windows. On Linux the port links
     // non-PIE, so the executable itself owns the sub-256MB VA range that
