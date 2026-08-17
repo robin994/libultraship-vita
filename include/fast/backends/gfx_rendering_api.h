@@ -10,6 +10,11 @@
 namespace Fast {
 struct ShaderProgram;
 
+struct GfxClipParameters {
+    bool z_is_from_0_to_1;
+    bool invertY;
+};
+
 enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
 
 // A hash function used to hash a: pair<float, float>
@@ -28,11 +33,17 @@ class GfxRenderingAPI {
     virtual ~GfxRenderingAPI() = default;
     virtual const char* GetName() = 0;
     virtual int GetMaxTextureSize() = 0;
-    virtual bool GetClipParameters() = 0;
+    virtual GfxClipParameters GetClipParameters() = 0;
     virtual void UnloadShader(ShaderProgram* oldPrg) = 0;
     virtual void LoadShader(ShaderProgram* newPrg) = 0;
+    virtual void ClearShaderCache() = 0;
     virtual ShaderProgram* CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) = 0;
     virtual ShaderProgram* LookupShader(uint64_t shaderId0, uint64_t shaderId1) = 0;
+    // Per-primitive depth override (G_ZS_PRIM / gDPSetPrimDepth). Backends
+    // cache the last-set value and a dirty flag (mCurrentPrimDepth/
+    // mPrimDepthDirty below) so the uniform/constant-buffer upload only
+    // happens when the value actually changes.
+    virtual void SetCurrentPrimDepth(float depth) = 0;
     virtual void ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) = 0;
     virtual uint32_t NewTexture() = 0;
     virtual void SelectTexture(int tile, uint32_t textureId) = 0;
@@ -67,6 +78,15 @@ class GfxRenderingAPI {
     virtual void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0,
                                  int dstY0, int dstX1, int dstY1) = 0;
     virtual void ClearFramebuffer(bool color, bool depth) = 0;
+    virtual void ClearDepthRegion(int x, int y, int w, int h) {
+        // Default: full depth clear. Backends that support scissored depth clears
+        // (e.g. OpenGL) should override for a more precise partial clear.
+        (void)x;
+        (void)y;
+        (void)w;
+        (void)h;
+        ClearFramebuffer(false, true);
+    }
     // Color-image-redirect emulation (SSB64 "gDPSetColorImage → Z buffer"
     // idiom). Both have conservative defaults so backends can adopt them
     // incrementally, mirroring DestroyFramebuffer/FbNeedsSampleVFlip below.
@@ -293,5 +313,7 @@ class GfxRenderingAPI {
     int8_t mLastDepthMask = -1;
     int8_t mLastZmodeDecal = -1;
     bool mSrgbMode = false;
+    float mCurrentPrimDepth = 0.0f;
+    bool mPrimDepthDirty = true;
 };
 } // namespace Fast

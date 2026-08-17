@@ -2816,83 +2816,56 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
-    float scaled_coeffs[MAX_LIGHTS][3];
-	if (mRsp->geometry_mode & G_LIGHTING) {
-		if (mRsp->lights_changed) {
-			for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
-				CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
-			}
-			/*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
-			static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
-			CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
-			CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
-			mRsp->lights_changed = false;
-		}
-        for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
-            scaled_coeffs[i][0] = mRsp->current_lights_coeffs[i][0] * 0.00787401f;
-            scaled_coeffs[i][1] = mRsp->current_lights_coeffs[i][1] * 0.00787401f;
-            scaled_coeffs[i][2] = mRsp->current_lights_coeffs[i][2] * 0.00787401f;
-        }
-	}
-	
-	float xAdjust;
-    if (mFbActive && mActiveFrameBuffer != mFrameBuffers.end() &&
-        (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect)) {
-        xAdjust = 1.f;
-    } else {
-        xAdjust = mCurAspectRatioDeltaForX;
-    }
-	
-    const bool doLighting = mRsp->geometry_mode & G_LIGHTING;
-#ifdef HAVE_POSITIONAL_LIGHTING
-    const bool doPositionalLighting = mRsp->geometry_mode & G_LIGHTING_POSITIONAL;
-#endif
-    const bool doFog = mRsp->geometry_mode & G_FOG;
-    const bool doTexGen = mRsp->geometry_mode & G_TEXTURE_GEN;
-    const bool doTexGenLinear = mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR;
-	
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
-        if (v == nullptr) {
-            return;
-        }
         const F3DVtx_tn* vn = &vertices[i].n;
         struct LoadedVertex* d = &mRsp->loaded_vertices[dest_index];
 
-        const float (*mp)[4] = mRsp->MP_matrix;
-        float x = (v->ob[0] * mp[0][0] + v->ob[1] * mp[1][0] +
-                  v->ob[2] * mp[2][0] + mp[3][0]) * xAdjust;
-        float y = v->ob[0] * mp[0][1] + v->ob[1] * mp[1][1] +
-                  v->ob[2] * mp[2][1] + mp[3][1];
-        float z = v->ob[0] * mp[0][2] + v->ob[1] * mp[1][2] +
-                  v->ob[2] * mp[2][2] + mp[3][2];
-        float w = v->ob[0] * mp[0][3] + v->ob[1] * mp[1][3] +
-                  v->ob[2] * mp[2][3] + mp[3][3];
+        if (v == nullptr) {
+            return;
+        }
 
-#ifdef HAVE_POSITIONAL_LIGHTING
+        float x = v->ob[0] * mRsp->MP_matrix[0][0] + v->ob[1] * mRsp->MP_matrix[1][0] +
+                  v->ob[2] * mRsp->MP_matrix[2][0] + mRsp->MP_matrix[3][0];
+        float y = v->ob[0] * mRsp->MP_matrix[0][1] + v->ob[1] * mRsp->MP_matrix[1][1] +
+                  v->ob[2] * mRsp->MP_matrix[2][1] + mRsp->MP_matrix[3][1];
+        float z = v->ob[0] * mRsp->MP_matrix[0][2] + v->ob[1] * mRsp->MP_matrix[1][2] +
+                  v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
+        float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
+                  v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+
         float world_pos[3] = { 0.0 };
-        if (doPositionalLighting) {
+        if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
             world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
-#endif
+
+        x = AdjXForAspectRatio(x);
 
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
 
-        if (doLighting) {
-            const float nx = vn->n[0], ny = vn->n[1], nz = vn->n[2];
-            const auto& ambient = mRsp->current_lights[mRsp->current_num_lights - 1].l;
-            int r = ambient.col[0];
-            int g = ambient.col[1];
-            int b = ambient.col[2];
+        if (mRsp->geometry_mode & G_LIGHTING) {
+            if (mRsp->lights_changed) {
+                for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+                    CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
+                }
+                /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
+                static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
+                CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
+                CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+                mRsp->lights_changed = false;
+            }
+
+            int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
+            int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
+            int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
 
             for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
                 float intensity = 0;
-#ifdef HAVE_POSITIONAL_LIGHTING
-                if (doPositionalLighting && (mRsp->current_lights[i].p.unk3 != 0)) {
+                if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
                     // Calculate distance from the light to the vertex
                     float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
                                           mRsp->current_lights[i].p.pos[1] - world_pos[1],
@@ -2911,13 +2884,13 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     float light_intensity[3];
                     for (int light_i = 0; light_i < 3; light_i++) {
                         light_intensity[light_i] = 4.0f * light_model[light_i] / dist_sq;
-                        light_intensity[light_i] = FAST_CLAMP(light_intensity[light_i], -1.0f, 1.0f);
+                        light_intensity[light_i] = std::clamp(light_intensity[light_i], -1.0f, 1.0f);
                     }
 
                     // Adjust intensity based on surface normal and sum up total
                     float total_intensity =
-                        light_intensity[0] * nx + light_intensity[1] * ny + light_intensity[2] * nz;
-                    total_intensity = FAST_CLAMP(total_intensity, -1.0f, 1.0f);
+                        light_intensity[0] * vn->n[0] + light_intensity[1] * vn->n[1] + light_intensity[2] * vn->n[2];
+                    total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
 
                     // Attenuate intensity based on attenuation values.
                     // Example formula found at https://ogldev.org/www/tutorial20/tutorial20.html
@@ -2925,49 +2898,43 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     // https://github.com/gonetz/GLideN64/blob/3b43a13a80dfc2eb6357673440b335e54eaa3896/src/gSP.cpp#L636
                     float distf = floorf(dist);
                     float attenuation = (distf * mRsp->current_lights[i].p.unk7 * 2.0f +
-                                         distf * distf * mRsp->current_lights[i].p.unkE * 0.125f) /
+                                         distf * distf * mRsp->current_lights[i].p.unkE / 8.0f) /
                                             (float)0xFFFF +
                                         1.0f;
                     intensity = total_intensity / attenuation;
-                    if (intensity > 0.0f) {
-                        r += intensity * mRsp->current_lights[i].l.col[0];
-                        g += intensity * mRsp->current_lights[i].l.col[1];
-                        b += intensity * mRsp->current_lights[i].l.col[2];
-                    }
-                } else
-#endif
-                {
-                    intensity += nx * scaled_coeffs[i][0];
-                    intensity += ny * scaled_coeffs[i][1];
-                    intensity += nz * scaled_coeffs[i][2];
-                    if (intensity > 0.0f) {
-                        r += intensity * mRsp->current_lights[i].l.col[0];
-                        g += intensity * mRsp->current_lights[i].l.col[1];
-                        b += intensity * mRsp->current_lights[i].l.col[2];
-                    }
+                } else {
+                    intensity += vn->n[0] * mRsp->current_lights_coeffs[i][0];
+                    intensity += vn->n[1] * mRsp->current_lights_coeffs[i][1];
+                    intensity += vn->n[2] * mRsp->current_lights_coeffs[i][2];
+                    intensity /= 127.0f;
+                }
+                if (intensity > 0.0f) {
+                    r += intensity * mRsp->current_lights[i].l.col[0];
+                    g += intensity * mRsp->current_lights[i].l.col[1];
+                    b += intensity * mRsp->current_lights[i].l.col[2];
                 }
             }
 
-            d->color.r = (uint8_t)std::min(r, 255);
-            d->color.g = (uint8_t)std::min(g, 255);
-            d->color.b = (uint8_t)std::min(b, 255);
+            d->color.r = r > 255 ? 255 : r;
+            d->color.g = g > 255 ? 255 : g;
+            d->color.b = b > 255 ? 255 : b;
 
-            if (doTexGen) {
+            if (mRsp->geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
-                dotx += nx * mRsp->current_lookat_coeffs[0][0];
-                dotx += ny * mRsp->current_lookat_coeffs[0][1];
-                dotx += nz * mRsp->current_lookat_coeffs[0][2];
-                doty += nx * mRsp->current_lookat_coeffs[1][0];
-                doty += ny * mRsp->current_lookat_coeffs[1][1];
-                doty += nz * mRsp->current_lookat_coeffs[1][2];
+                dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
+                dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
+                dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
+                doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
+                doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
+                doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
 
-                dotx *= 0.00787401f;
-                doty *= 0.00787401f;
+                dotx /= 127.0f;
+                doty /= 127.0f;
 
-                dotx = FAST_CLAMP(dotx, -1.0f, 1.0f);
-                doty = FAST_CLAMP(doty, -1.0f, 1.0f);
+                dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
+                doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
 
-                if (doTexGenLinear) {
+                if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
                     // Not sure exactly what formula we should use to get accurate values
                     /*dotx = (2.906921f * dotx * dotx + 1.36114f) * dotx;
                     doty = (2.906921f * doty * doty + 1.36114f) * doty;
@@ -2976,8 +2943,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     dotx = acosf(-dotx) /* M_PI */ * 0.159155f;
                     doty = acosf(-doty) /* M_PI */ * 0.159155f;
                 } else {
-                    dotx = (dotx + 1.0f) * 0.25f;
-                    doty = (doty + 1.0f) * 0.25f;
+                    dotx = (dotx + 1.0f) / 4.0f;
+                    doty = (doty + 1.0f) / 4.0f;
                 }
 
                 U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
@@ -3041,10 +3008,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             float winv = 1.0f / w;
             if (winv < 0.0f) {
                 winv = std::numeric_limits<int16_t>::max();
-			}
+            }
 
             float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
-            fog_z = FAST_CLAMP(fog_z, 0.0f, 255.0f);
+            fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
             d->color.a = v->cn[3];
@@ -3062,7 +3029,121 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->u = s;
     v->v = t;
 }
+void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
+    struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
+    struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
+    struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 
+    // if (rand()%2) return;
+
+    if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
+        // The whole triangle lies outside the visible area
+        return;
+    }
+
+    const uint32_t cull_both = get_attr(CULL_BOTH);
+    const uint32_t cull_front = get_attr(CULL_FRONT);
+    const uint32_t cull_back = get_attr(CULL_BACK);
+
+    if ((mRsp->geometry_mode & cull_both) != 0) {
+        float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+        float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+        float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
+        float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
+        float cross = dx1 * dy2 - dy1 * dx2;
+
+        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
+            // If one vertex lies behind the eye, negating cross will give the correct result.
+            // If all vertices lie behind the eye, the triangle will be rejected anyway.
+            cross = -cross;
+        }
+
+        // If inverted culling is requested, negate the cross
+        if (ucode_handler_index == UcodeHandlers::ucode_f3dex2 &&
+            (mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) == 1) {
+            cross = -cross;
+        }
+
+        auto cull_type = mRsp->geometry_mode & cull_both;
+
+        if (cull_type == cull_front) {
+            if (cross <= 0) {
+                return;
+            }
+        } else if (cull_type == cull_back) {
+            if (cross >= 0) {
+                return;
+            }
+        } else if (cull_type == cull_both) {
+            // Why is this even an option?
+            return;
+        }
+    }
+
+    // PORT: on the RDP, depth *comparison* is enabled solely by Z_CMP in
+    // other_mode_l; G_ZBUFFER in geometry mode only makes the RSP emit
+    // per-vertex Z (a prerequisite for any Z op, not a request to test).
+    // Deriving depth_test from G_ZBUFFER alone Z-rejects primitives whose
+    // render mode has Z_CMP clear — hardware never compares those. SSB64's
+    // intro explosion draws its red outer ring (Outline mesh) with G_ZBUFFER
+    // set but Z_CMP/Z_UPD clear, immediately after the redirect fill stamps
+    // the whole Z buffer to near: with gm-derived testing every ring pixel
+    // fails and the hardware-visible red starburst border vanishes.
+    bool has_vertex_z = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    bool depth_test = has_vertex_z && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
+    bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    // PORT: SSB64's mvOpeningRoom transition Overlay/Outline use the N64
+    // "redirect color image to Z buffer" idiom: tris are drawn with G_ZBUFFER
+    // set in geometry_mode but no Z_CMP/Z_UPD in render mode, so on real
+    // hardware they bypass depth comparison and write into the ZB as if it
+    // were a colour buffer.
+    bool redirect_active = RdpColorImageIsZBuffer();
+    if (redirect_active) {
+        // On real hardware a redirect-active draw's combiner output is written
+        // to the Z buffer as pixel data — unconditionally, regardless of
+        // Z_UPD (that flag governs the *depth* path, but here the *color*
+        // path is what lands in the Z buffer). Emulate by forcing depth
+        // writes on; the written value is synthesized below (see the
+        // use_prim_depth override) and framebuffer color writes are
+        // suppressed via SetColorWriteMask.
+        depth_mask = true;
+    }
+    uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
+    if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
+        Flush();
+        mRapi->SetDepthTestAndMask(depth_test, depth_mask);
+        mRenderingState.depth_test_and_mask = depth_test_and_mask;
+    }
+
+    // Suppress framebuffer color writes while the color image is redirected to
+    // the Z buffer: on hardware such draws have no color side effect. Backends
+    // without an override keep the previous (visible-draw) behavior.
+    bool color_write = !redirect_active;
+    if (color_write != mRenderingState.color_write_enabled) {
+        Flush();
+        mRapi->SetColorWriteMask(color_write);
+        mRenderingState.color_write_enabled = color_write;
+    }
+
+    bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+    if (zmode_decal != mRenderingState.decal_mode) {
+        Flush();
+        mRapi->SetZmodeDecal(zmode_decal);
+        mRenderingState.decal_mode = zmode_decal;
+    }
+
+    if (mRdp->viewport_or_scissor_changed) {
+        if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
+            Flush();
+            mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
+            mRenderingState.viewport = mRdp->viewport;
+        }
+        if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
+            Flush();
+            mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
+            mRenderingState.scissor = mRdp->scissor;
+        }
         mRdp->viewport_or_scissor_changed = false;
     }
 
@@ -3628,7 +3709,6 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
         Flush();
     }
 }
-
 void Interpreter::GfxSpGeometryMode(uint32_t clear, uint32_t set) {
     mRsp->geometry_mode &= ~clear;
     mRsp->geometry_mode |= set;
@@ -3642,8 +3722,8 @@ void Interpreter::GfxSpExtraGeometryMode(uint32_t clear, uint32_t set) {
 void Interpreter::AdjustVIewportOrScissor(XYWidthHeight* area) {
     if (!mFbActive) {
         // Adjust the y origin based on the y-inversion for the active framebuffer
-        bool invertY = mRapi->GetClipParameters();
-        if (invertY) {
+        GfxClipParameters clipParameters = mRapi->GetClipParameters();
+        if (clipParameters.invertY) {
             area->y -= area->height;
         } else {
             area->y = mNativeDimensions.height - area->y;
@@ -4738,7 +4818,7 @@ void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
     if ((bool)gfx_check_image_signature((char*)data)) {
 		
         std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-            Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcessFast((char*)data + 7));
+            Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess((char*)data));
         texFlags = tex->Flags;
         rawTexMetadata.width = tex->Width;
         rawTexMetadata.height = tex->Height;
@@ -4775,7 +4855,7 @@ void Interpreter::Gfxs2dexBg1cyc(F3DuObjBg* bg) {
 
     if ((bool)gfx_check_image_signature((char*)data)) {
         std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-            Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcessFast((char*)data + 7));
+            Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess((char*)data));
         texFlags = tex->Flags;
         rawTexMetadata.width = tex->Width;
         rawTexMetadata.height = tex->Height;
@@ -5781,7 +5861,7 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
             std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
-                Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcessFast(imgData + 7));
+                Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(imgData));
 
             if (tex == nullptr) {
                 (*cmd0)++;

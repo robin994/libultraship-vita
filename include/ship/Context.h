@@ -44,7 +44,7 @@ class Context {
     static std::shared_ptr<Context> CreateUninitializedInstance(const std::string name, const std::string shortName,
                                                                 const std::string configFilePath);
     static std::string GetAppBundlePath();
-    static std::string GetAppDirectoryPath(std::string appName = "");
+    static std::string GetAppDirectoryPath(const std::string& appName = "");
     static std::string GetPathRelativeToAppDirectory(const std::string path, std::string appName = "");
     static std::string GetPathRelativeToAppBundle(const std::string path);
     static std::string LocateFileAcrossAppDirs(const std::string path, std::string appName = "");

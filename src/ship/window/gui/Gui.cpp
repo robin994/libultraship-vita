@@ -522,7 +522,15 @@ void Gui::DrawMenu() {
 
     const ImGuiID dockId = ImGui::GetID("main_dock");
 
-    if (!ImGui::DockBuilderGetNode(dockId)) {
+    // viewport->Size can still be (0,0) on the very first frame ever drawn
+    // (NewFrame()'s backend/WM calls haven't necessarily settled real
+    // window geometry yet) - DockBuilderSetNodeSize() asserts on a
+    // non-positive size, which used to crash the app outright the first
+    // time something forced an early frame (e.g. a boot-time loading
+    // screen) before any "real" frame had run. Skip and retry next frame
+    // instead; DockBuilderGetNode(dockId) stays null until this actually
+    // succeeds, so nothing here is lost, just delayed a frame or two.
+    if (!ImGui::DockBuilderGetNode(dockId) && viewport->Size.x > 0.0f && viewport->Size.y > 0.0f) {
         ImGui::DockBuilderRemoveNode(dockId);
         ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_NoTabBar);
         ImGui::DockBuilderSetNodeSize(dockId, ImVec2(viewport->Size.x, viewport->Size.y));

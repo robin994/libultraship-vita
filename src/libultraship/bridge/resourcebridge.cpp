@@ -43,10 +43,6 @@ void* ResourceGetDataByName(const char* name) {
     return Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer(name);
 }
 
-void* ResourceGetDataByNameOtr(const char* name) {
-    return Ship::Context::GetInstance()->GetResourceManager()->GetOtrResourceRawPointer(name);
-}
-
 void* ResourceGetDataByCrc(uint64_t crc) {
     return Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer(crc);
 }

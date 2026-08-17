@@ -376,7 +376,10 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     width = 960;
     height = 545;
     SDL_setenv("VITA_USE_GLSL_TRANSLATOR", "1", 1);
-    sceIoMkdir("ux0:data/ghostship/shader_cache", 0777);
+    // Was hardcoded to Rinnegatamante's own "ux0:data/ghostship" from the
+    // Ghostship fork this file was merged from - see GetAppBundlePath()'s
+    // fix in Context.cpp for the full story.
+    sceIoMkdir((Ship::Context::GetAppDirectoryPath() + "/shader_cache").c_str(), 0777);
 #endif
     mWindowWidth = width;
     mWindowHeight = height;

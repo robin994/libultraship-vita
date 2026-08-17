@@ -37,6 +37,15 @@
 #include <psp2/gxm.h>
 extern "C" {
     void vglBufferData(GLenum target, const GLvoid *data);
+    // vitaGL implements glAttachShader/glCompileShader/glCreateShader/
+    // glDeleteShader/glLinkProgram but not glDetachShader. imgui's OpenGL3
+    // backend calls it as a post-link cleanup step (optional per the GL
+    // spec - glDeleteShader alone is sufficient once nothing references
+    // the shader object), so a no-op stub is sufficient here.
+    void glDetachShader(GLuint program, GLuint shader) {
+        (void)program;
+        (void)shader;
+    }
 };
 #define SHADER_MAGIC (1)
 #endif
@@ -52,8 +61,8 @@ const char* GfxRenderingAPIOGL::GetName() {
     return "OpenGL";
 }
 
-bool GfxRenderingAPIOGL::GetClipParameters() {
-    return mFrameBuffers[mCurrentFrameBuffer].invertY;
+GfxClipParameters GfxRenderingAPIOGL::GetClipParameters() {
+    return { false, mFrameBuffers[mCurrentFrameBuffer].invertY };
 }
 
 static void VertexArraySetAttribs(ShaderProgram* prg) {
@@ -600,7 +609,11 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     unsigned int prog_format = 0;
     void* prog_bin = nullptr;
     char fname[256];
-    sprintf(fname, "ux0:data/ghostship/shader_cache/%016llX_%016llX_%d.bin", shader_id1, shader_id0, SHADER_MAGIC);
+    // Was hardcoded to Rinnegatamante's own "ux0:data/ghostship" from the
+    // Ghostship fork this file was merged from - see GetAppBundlePath()'s
+    // fix in Context.cpp for the full story.
+    snprintf(fname, sizeof(fname), "%s/shader_cache/%016llX_%016llX_%d.bin",
+             Ship::Context::GetAppDirectoryPath().c_str(), shader_id1, shader_id0, SHADER_MAGIC);
     FILE* f = fopen(fname, "rb");
     if (f) {
         shader_program = glCreateProgram();

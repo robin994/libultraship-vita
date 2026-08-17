@@ -167,7 +167,22 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         mLogger = std::make_shared<spdlog::async_logger>(GetName(), sinks.begin(), sinks.end(), spdlog::thread_pool(),
                                                          spdlog::async_overflow_policy::block);
         GetLogger()->set_level(releaseBuildLogLevel);
+#ifdef __vita__
+        // async_logger::flush() isn't fire-and-forget - it blocks the
+        // calling thread until the background worker drains its queue AND
+        // the OS-level write/fsync completes. flush_on(info) means every
+        // routine info-level log call pays that cost; ArchiveManager logs
+        // per-resource at info while indexing a multi-thousand-entry .o2r,
+        // and real hardware's microSD write latency turns that into a long
+        // silent stall with nothing on screen - easily mistaken for a hang
+        // (a psp2dmp kept catching the main thread here, always mid
+        // fflush -> __sfvwrite_r -> __swrite -> sceIoWrite). Vita3K's
+        // host-filesystem-backed storage is fast enough that this never
+        // showed up there. Flush only on genuine problems.
+        GetLogger()->flush_on(spdlog::level::err);
+#else
         GetLogger()->flush_on(spdlog::level::info);
+#endif
 #endif
         GetLogger()->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%@] [%l] %v");
 
@@ -446,8 +461,17 @@ std::string Context::GetShortName() {
 }
 
 std::string Context::GetAppBundlePath() {
-#ifdef __vita__	
-	return std::string("ux0:data/ghostship");
+#ifdef __vita__
+	// The read-only VPK-mounted partition, not ux0:data (that's
+	// GetAppDirectoryPath(), the writable per-app storage dir). Was
+	// hardcoded to Rinnegatamante's own "ux0:data/ghostship" from the
+	// Ghostship fork this Vita rendering layer was merged from - wrong
+	// app, and wrong device besides. ArchiveManager::Init() has a
+	// dedicated app0-prefix strip (archive.starts_with("app0")) for
+	// exactly this path, so callers building "GetAppBundlePath() + / +
+	// name" (e.g. PortLocateFile's f3d.o2r bootstrap-archive lookup) get
+	// a path that Vita's archive loader actually knows how to open.
+	return std::string("app0:");
 #endif
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
