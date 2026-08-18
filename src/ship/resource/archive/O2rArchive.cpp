@@ -4,8 +4,19 @@
 #include "ship/window/Window.h"
 #include "spdlog/spdlog.h"
 
+#ifdef __vita__
+#include <algorithm>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#include <psp2/kernel/clib.h>
+#endif
+
 namespace Ship {
-O2rArchive::O2rArchive(const std::string& archivePath) : Archive(archivePath) {
+/* mZipArchive MUST start null: Close() (called from the destructor) only
+ * skips zip_close() when it is null, and Open() now has early-return paths
+ * that leave it untouched. Left uninitialized, a failed Open() handed
+ * zip_close() a garbage pointer and took a data abort. */
+O2rArchive::O2rArchive(const std::string& archivePath) : Archive(archivePath), mZipArchive(nullptr) {
 }
 
 O2rArchive::~O2rArchive() {
@@ -66,12 +77,105 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     return fileToLoad;
 }
 
+#ifdef __vita__
+/* Read an entire file into `out` using raw kernel I/O.
+ *
+ * Real-hardware testing repeatedly produced a psp2dmp with the main thread
+ * faulting inside sceIoLseek32, reached through libzip's stdio file source
+ * (_zip_stdio_op_seek -> _fseeko_r -> __sseek -> _lseek_r -> sceIoLseek32),
+ * always seeking to the exact same archive offset. The same binary runs
+ * fine under Vita3K, whose HLE filesystem never exercises that path the
+ * same way. Rather than keep chasing the syscall, drop the dependency:
+ * pull the archive into RAM once with sceIoOpen/sceIoRead (no lseek, no
+ * newlib stdio) and hand libzip a plain memory buffer. Random access then
+ * costs nothing and never touches the filesystem again - which is also a
+ * straight win on a console reading from a slow microSD.
+ *
+ * Size comes from sceIoGetstat rather than a seek-to-end for the same
+ * reason: it avoids lseek entirely. */
+static bool VitaReadWholeFile(const std::string& path, std::vector<uint8_t>& out) {
+    SceIoStat stat;
+    sceClibMemset(&stat, 0, sizeof(stat));
+    const int statRc = sceIoGetstat(path.c_str(), &stat);
+    if (statRc < 0) {
+        SPDLOG_ERROR("sceIoGetstat failed for \"{}\" (rc=0x{:08X})", path, (unsigned int)statRc);
+        return false;
+    }
+
+    const SceOff fileSize = stat.st_size;
+    if (fileSize <= 0) {
+        SPDLOG_ERROR("Archive \"{}\" reports size {}", path, (long long)fileSize);
+        return false;
+    }
+
+    SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        SPDLOG_ERROR("sceIoOpen failed for \"{}\" (rc=0x{:08X})", path, (unsigned int)fd);
+        return false;
+    }
+
+    out.resize(static_cast<size_t>(fileSize));
+
+    /* Chunked so a single huge request can't trip the driver, and so a
+     * short read is detected rather than silently leaving a partial tail. */
+    const size_t kChunk = 1u * 1024u * 1024u;
+    size_t done = 0;
+    while (done < out.size()) {
+        const size_t want = std::min(kChunk, out.size() - done);
+        const int got = sceIoRead(fd, out.data() + done, want);
+        if (got <= 0) {
+            break;
+        }
+        done += static_cast<size_t>(got);
+    }
+    sceIoClose(fd);
+
+    if (done != out.size()) {
+        SPDLOG_ERROR("Short read on \"{}\": got {} of {} bytes", path, (unsigned int)done, (unsigned int)out.size());
+        out.clear();
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool O2rArchive::Open() {
+#ifdef __vita__
+    if (!VitaReadWholeFile(GetPath(), mArchiveBuffer)) {
+        SPDLOG_ERROR("Failed to read zip file into memory \"{}\"", GetPath());
+        return false;
+    }
+
+    zip_error_t zipErr;
+    zip_error_init(&zipErr);
+    /* freep = 0: libzip must not take ownership of mArchiveBuffer's storage. */
+    zip_source_t* source = zip_source_buffer_create(mArchiveBuffer.data(), mArchiveBuffer.size(), 0, &zipErr);
+    if (source == nullptr) {
+        SPDLOG_ERROR("Failed to create in-memory zip source for \"{}\": {}", GetPath(),
+                     zip_error_strerror(&zipErr));
+        zip_error_fini(&zipErr);
+        mArchiveBuffer.clear();
+        return false;
+    }
+
+    mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipErr);
+    if (mZipArchive == nullptr) {
+        SPDLOG_ERROR("Failed to load zip file from memory \"{}\": {}", GetPath(), zip_error_strerror(&zipErr));
+        zip_source_free(source); /* only ours to free when the open failed */
+        zip_error_fini(&zipErr);
+        mArchiveBuffer.clear();
+        return false;
+    }
+    zip_error_fini(&zipErr);
+
+    SPDLOG_INFO("Loaded archive \"{}\" into memory ({} bytes)", GetPath(), mArchiveBuffer.size());
+#else
     mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
     if (mZipArchive == nullptr) {
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;
     }
+#endif
 
     auto zipNumEntries = zip_get_num_entries(mZipArchive, 0);
     for (auto i = 0; i < zipNumEntries; i++) {
@@ -101,10 +205,25 @@ bool O2rArchive::Close() {
     }
 
     mZipArchive = nullptr;
+#ifdef __vita__
+    /* Safe to drop only now that zip_close() has released the buffer source
+     * that was pointing into it (see Open()). */
+    mArchiveBuffer.clear();
+    mArchiveBuffer.shrink_to_fit();
+#endif
     return true;
 }
 
 bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_t>& data) {
+#ifdef __vita__
+    /* Vita opens archives read-only from an in-memory buffer (see Open()),
+     * so there is no on-disk handle to write back through. Nothing in the
+     * boot path writes to an archive; fail loudly rather than silently
+     * corrupting state or reopening a second, disk-backed handle. */
+    (void)data;
+    SPDLOG_ERROR("Cannot write to zip \"{}\": archives are read-only on Vita (file \"{}\")", GetPath(), filePath);
+    return false;
+#else
     if (!mZipArchive) {
         SPDLOG_ERROR("Cannot write to zip: Archive is not open.");
         return false;
@@ -146,6 +265,7 @@ bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_
 
     // Success
     return true;
+#endif
 }
 
 } // namespace Ship

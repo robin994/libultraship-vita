@@ -56,6 +56,21 @@ void ResourceManager::Init(const std::vector<std::string>& archivePaths,
     mArchiveManager = std::make_shared<ArchiveManager>();
     GetArchiveManager()->Init(archivePaths, validHashes);
 
+#ifdef __vita__
+    // Real-hardware testing this session repeatedly showed the main thread
+    // parked in a generic kernel wait (at a point that moved around between
+    // runs) while this pool's own worker thread(s) sat "Running" in a
+    // coredump doing real file I/O (sceIoWrite/sceIoLseek32) - capping the
+    // pool to a single worker didn't resolve it either. Rinnegatamante
+    // (author of the Vita-patched rendering layer this port's libultraship
+    // fork is merged from) confirmed he removed ResourceManager's thread
+    // pool entirely as one of several Vita-specific optimizations in his own
+    // fork - every LoadResourceAsync/LoadResourcesAsync/DirtyResources/
+    // UnloadResourcesAsync call site below now runs synchronously on Vita
+    // instead of submitting to mThreadPool, so the pool itself is never
+    // used there and isn't created at all.
+    (void)reservedThreadCount;
+#else
     // the extra `- 1` is because we reserve an extra thread for spdlog
     size_t threadCount = std::max(1, (int32_t)(std::thread::hardware_concurrency() - reservedThreadCount - 1));
     mThreadPool = std::make_shared<BS::thread_pool>(threadCount);
@@ -64,6 +79,7 @@ void ResourceManager::Init(const std::vector<std::string>& archivePaths,
         // Nothing ever unpauses the thread pool since nothing will ever try to load the archive again.
         mThreadPool->pause();
     }
+#endif
 }
 
 ResourceManager::~ResourceManager() {
@@ -211,11 +227,28 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         return promise->get_future().share();
     }
 
+#ifdef __vita__
+    // Rinnegatamante (author of the Vita-patched rendering layer this port's
+    // libultraship fork is merged from) removed ResourceManager's thread
+    // pool entirely as one of several Vita-specific optimizations. This
+    // session's own real-hardware testing independently converged on the
+    // same conclusion from the other direction: a psp2dmp coredump showed
+    // the main thread genuinely stalled with worker-pool threads "Running"
+    // concurrently inside real file I/O (sceIoWrite/sceIoLseek32) - dropping
+    // the pool to a single worker thread didn't resolve it either. Load
+    // synchronously on the calling thread instead - still wrapped in the
+    // same shared_future the caller already expects, so nothing downstream
+    // needs to change.
+    auto promise = std::make_shared<std::promise<std::shared_ptr<IResource>>>();
+    promise->set_value(LoadResourceProcess(identifier, loadExact, initData));
+    return promise->get_future().share();
+#else
     return mThreadPool->submit_task(
         [this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
             return LoadResourceProcess(identifier, loadExact, initData);
         },
         priority);
+#endif
 }
 
 std::shared_future<std::shared_ptr<IResource>>
@@ -328,11 +361,18 @@ ResourceManager::LoadResourcesProcess(const ResourceFilter& filter) {
 
 std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
 ResourceManager::LoadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
+#ifdef __vita__
+    // See LoadResourceAsync's comment above - no thread pool on Vita.
+    auto promise = std::make_shared<std::promise<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>>();
+    promise->set_value(LoadResourcesProcess(filter));
+    return promise->get_future().share();
+#else
     return mThreadPool->submit_task(
         [this, filter]() -> std::shared_ptr<std::vector<std::shared_ptr<IResource>>> {
             return LoadResourcesProcess(filter);
         },
         priority);
+#endif
 }
 
 std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
@@ -349,7 +389,7 @@ std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadRe
 }
 
 void ResourceManager::DirtyResources(const ResourceFilter& filter) {
-    mThreadPool->submit_task([this, filter]() -> void {
+    auto doDirty = [this, filter]() -> void {
         auto list = GetArchiveManager()->ListFiles(filter.IncludeMasks, filter.ExcludeMasks);
 
         for (const auto& key : *list.get()) {
@@ -361,7 +401,13 @@ void ResourceManager::DirtyResources(const ResourceFilter& filter) {
                 UnloadResource({ key, filter.Owner, filter.Parent });
             }
         }
-    });
+    };
+#ifdef __vita__
+    // See LoadResourceAsync's comment above - no thread pool on Vita.
+    doDirty();
+#else
+    mThreadPool->submit_task(doDirty);
+#endif
 }
 
 void ResourceManager::DirtyResources(const std::string& searchMask) {
@@ -373,7 +419,12 @@ void ResourceManager::UnloadResourcesAsync(const std::string& searchMask, BS::pr
 }
 
 void ResourceManager::UnloadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
+#ifdef __vita__
+    // See LoadResourceAsync's comment above - no thread pool on Vita.
+    UnloadResourcesProcess(filter);
+#else
     mThreadPool->submit_task([this, filter]() -> void { UnloadResourcesProcess(filter); }, priority);
+#endif
 }
 
 void ResourceManager::UnloadResources(const std::string& searchMask) {

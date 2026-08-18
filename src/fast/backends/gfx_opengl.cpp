@@ -1154,7 +1154,7 @@ static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, 
     if (verts > 6) {
         verts = 6;
     }
-    fprintf(sVboLog, "draw %d tris=%zu:", sGLDumpDrawIndex, num_tris);
+    fprintf(sVboLog, "draw %d tris=%u:", sGLDumpDrawIndex, (unsigned int)num_tris);
     for (size_t i = 0; i < verts; i++) {
         const float* v = buf + i * stride_floats;
         fprintf(sVboLog, "  (%.3f,%.3f,%.3f,%.3f)", v[0], v[1], v[2], v[3]);

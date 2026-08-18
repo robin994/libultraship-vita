@@ -449,6 +449,7 @@ extern "C" {
 void *vglAllocFromScratch(size_t size);
 void vglFree(void*);
 void vglSetParamBufferSize(uint32_t size);
+void vglUseTripleBuffering(uint8_t usage);
 uint8_t vglInitWithCustomThreshold(int pool_size, int width, int height, int ram_threshold, int cdram_threshold, int phycont_threshold, int cdlg_threshold, SceGxmMultisampleMode msaa);
 #ifdef HAVE_TROPHIES
 int trophies_init();
@@ -532,6 +533,11 @@ Interpreter::Interpreter() {
     mRdp->palettes[1] = mRdp->palette_staging[1];
 #ifdef __vita__
     vglSetParamBufferSize(6 * 1024 * 1024);
+    /* Triple buffering costs a whole extra display framebuffer's worth of
+     * VRAM; per Rinnegatamante, dropping to double buffering is one of the
+     * standard vitaGL memory-pressure knobs on this platform. Must be set
+     * before vglInitWithCustomThreshold, which reads it during setup. */
+    vglUseTripleBuffering(0 /* GL_FALSE - not in scope here, double-buffer */);
     vglInitWithCustomThreshold(0, 960, 544, 4 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_4X);
     mBufVbo = (float *)vglAllocFromScratch(10 * 1024 * 1024);
 #else

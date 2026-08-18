@@ -5,6 +5,7 @@
 #include <string>
 #include <stdint.h>
 #include <string>
+#include <vector>
 
 #include "zip.h"
 
@@ -29,5 +30,11 @@ class O2rArchive final : virtual public Archive {
 
   private:
     zip_t* mZipArchive;
+
+    /* Vita only: the whole archive, read into RAM up front via raw sceIo*
+     * calls so libzip never seeks/reads through newlib stdio. libzip's
+     * buffer source does NOT own or copy this, so it must outlive
+     * mZipArchive - see O2rArchive::Open(). Empty on every other platform. */
+    std::vector<uint8_t> mArchiveBuffer;
 };
 } // namespace Ship

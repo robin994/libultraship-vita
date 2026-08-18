@@ -13,7 +13,7 @@ static bool hookOptCollapseAll;
 static bool hookOptExpandAll;
 
 void DrawEventCallerInfo(std::string& name, EventRegistration& registry) {
-    ImGui::Text("Total Callers Registered: %zu", registry.Callers.size());
+    ImGui::Text("Total Callers Registered: %u", (unsigned int)registry.Callers.size());
 
     if (ImGui::BeginTable(("Table##" + std::string(name)).c_str(), 4,
                           ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
@@ -41,7 +41,7 @@ void DrawEventCallerInfo(std::string& name, EventRegistration& registry) {
 }
 
 void DrawEventListenerInfo(std::string& name, const EventRegistration& registry) {
-    ImGui::Text("Total Listeners Registered: %zu", registry.Listeners.size());
+    ImGui::Text("Total Listeners Registered: %u", (unsigned int)registry.Listeners.size());
 
     if (ImGui::BeginTable(("Table##" + std::string(name)).c_str(), 4,
                           ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |

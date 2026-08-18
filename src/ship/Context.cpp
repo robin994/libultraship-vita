@@ -179,7 +179,12 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         // fflush -> __sfvwrite_r -> __swrite -> sceIoWrite). Vita3K's
         // host-filesystem-backed storage is fast enough that this never
         // showed up there. Flush only on genuine problems.
-        GetLogger()->flush_on(spdlog::level::err);
+        // TEMPORARY DIAGNOSTIC (revert after use): flushing on every info
+        // line to see what ResourceManager/ArchiveManager actually logged
+        // before the real-hardware crash this session is chasing - the
+        // BattleShip.log file has been staying at 0 bytes because nothing
+        // ever forced a flush before the process died.
+        GetLogger()->flush_on(spdlog::level::info);
 #else
         GetLogger()->flush_on(spdlog::level::info);
 #endif
