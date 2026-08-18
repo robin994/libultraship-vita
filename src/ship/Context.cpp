@@ -116,10 +116,30 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
 
     try {
         // Setup Logging
+#ifndef __vita__
+        /* Real-hardware Vita testing traced a recurring crash to
+         * pte_osMutexLock inside a std::condition_variable's destruction
+         * (VitaSDK's pthread-embedded mutex lock wraps a real kernel call
+         * that faults when made from the game coroutine's manually swapped
+         * stack - see docs/bugs/ and the __vita__ logger branch below).
+         * spdlog's async_logger was the first thing found using this
+         * thread pool and was switched to a synchronous logger, but the
+         * pool object itself - with its own condition_variable - kept
+         * existing and getting torn down regardless, since nothing on
+         * Vita ever uses it anymore. Skip creating it in the first place. */
         spdlog::init_thread_pool(8192, 1);
+#endif
         std::vector<spdlog::sink_ptr> sinks;
 
-#if (!defined(_WIN32)) || defined(_DEBUG)
+/* Vita has no console to read stdout from, and spdlog's stdout sink writes
+ * through this VitaSDK newlib build's buffered C stdio - the same fflush ->
+ * write() chain that real-hardware testing already found could stall/fault
+ * the calling thread under concurrent access from port_log() (see
+ * port/port_log.c). Several real OS threads (audio, scheduler, controller)
+ * can call SPDLOG_INFO concurrently right as they spin up during coroutine
+ * boot, so this sink is excluded on Vita entirely rather than trying to make
+ * concurrent calls into it safe. */
+#if ((!defined(_WIN32)) || defined(_DEBUG)) && !defined(__vita__)
 #if defined(_DEBUG) && defined(_WIN32)
         // LLVM on Windows allocs a hidden console in its entrypoint function.
         // We free that console here to create our own.
@@ -156,38 +176,55 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         sinks.push_back(systemConsoleSink);
 #endif
 
+#ifndef __vita__
+        /* rotating_file_sink_mt writes through this platform's buffered C
+         * stdio (fopen/fwrite/fflush) - the exact fflush -> write() chain
+         * real-hardware testing already proved unsafe to call from the
+         * game coroutine's manually swapped stack (see port/port_log.c's
+         * header comment and docs/bugs/ for the general "syscall from
+         * that stack faults" finding). Any WARN/ERROR-level SPDLOG call
+         * made from inside syMainLoop() - which is most of the game after
+         * boot - would hit this. Skip the file sink on Vita entirely
+         * rather than trying to make it safe; port_log()'s ssb64.log
+         * (raw fd + write(2), no buffered stdio, already proven reliable
+         * all session) is the crash-safe log on this platform. */
         auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
         auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
         sinks.push_back(fileSink);
-#ifdef _DEBUG
+#endif
+#if defined(_DEBUG) || defined(__vita__)
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
+#ifdef __vita__
+        // Real-hardware testing traced a deterministic crash to
+        // pte_osMutexLock (VitaSDK's pthread-embedded mutex lock, which
+        // wraps a real kernel call) inside a std::condition_variable's
+        // destruction, reached from spdlog::async_logger's thread_pool
+        // (mpmc_blocking_queue, which owns a condition_variable + mutex
+        // for producer/consumer signaling) - filtering the log level down
+        // didn't stop it, since the pool and its sync primitives exist and
+        // get touched regardless of how many messages actually get
+        // through. This is the same "syscall from the game coroutine's
+        // manually swapped stack faults on real hardware" class of bug as
+        // sceKernelDelayThread/write() (see docs/bugs/). The synchronous
+        // spdlog::logger has no thread pool and no condition_variable at
+        // all - it writes directly on the calling thread instead of
+        // requiring cross-thread synchronization, sidestepping the
+        // primitive entirely rather than trying to reduce contention on it.
+        GetLogger()->set_level(releaseBuildLogLevel);
+        // Flush only on genuine problems - see the flush_on comment this
+        // replaced further down for why routine info-level flushing
+        // stalls real hardware (rotating_file_sink_mt's own fflush/write
+        // chain, independent of the async machinery removed here).
+        GetLogger()->flush_on(spdlog::level::err);
+#else
         GetLogger()->set_level(debugBuildLogLevel);
         GetLogger()->flush_on(spdlog::level::trace);
+#endif
 #else
         mLogger = std::make_shared<spdlog::async_logger>(GetName(), sinks.begin(), sinks.end(), spdlog::thread_pool(),
                                                          spdlog::async_overflow_policy::block);
         GetLogger()->set_level(releaseBuildLogLevel);
-#ifdef __vita__
-        // async_logger::flush() isn't fire-and-forget - it blocks the
-        // calling thread until the background worker drains its queue AND
-        // the OS-level write/fsync completes. flush_on(info) means every
-        // routine info-level log call pays that cost; ArchiveManager logs
-        // per-resource at info while indexing a multi-thousand-entry .o2r,
-        // and real hardware's microSD write latency turns that into a long
-        // silent stall with nothing on screen - easily mistaken for a hang
-        // (a psp2dmp kept catching the main thread here, always mid
-        // fflush -> __sfvwrite_r -> __swrite -> sceIoWrite). Vita3K's
-        // host-filesystem-backed storage is fast enough that this never
-        // showed up there. Flush only on genuine problems.
-        // TEMPORARY DIAGNOSTIC (revert after use): flushing on every info
-        // line to see what ResourceManager/ArchiveManager actually logged
-        // before the real-hardware crash this session is chasing - the
-        // BattleShip.log file has been staying at 0 bytes because nothing
-        // ever forced a flush before the process died.
         GetLogger()->flush_on(spdlog::level::info);
-#else
-        GetLogger()->flush_on(spdlog::level::info);
-#endif
 #endif
         GetLogger()->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%@] [%l] %v");
 

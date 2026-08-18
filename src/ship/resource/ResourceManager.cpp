@@ -11,6 +11,35 @@
 
 namespace Ship {
 
+#ifdef __vita__
+/* Real-hardware Vita testing traced a deterministic crash - always at the
+ * very first resource load, always the same kernel object UID, no ASLR on
+ * this platform to make it look different run to run - to pte_osMutexLock
+ * inside a std::condition_variable's destruction (see docs/bugs/). A
+ * std::promise/std::future pair's shared state always allocates a real
+ * mutex + condition_variable, even when resolved purely synchronously with
+ * no cross-thread waiting ever happening (LoadResourceAsync's Vita branch
+ * below does exactly that): the crash is in DESTROYING that shared state
+ * from the game coroutine's manually swapped stack, not in using it.
+ * Removing the (unused-on-Vita) BS::thread_pool and spdlog's async logger
+ * thread pool earlier this session didn't touch this - this is a separate
+ * instance of the same "syscall from that stack faults" bug, from a
+ * std::promise/future created fresh on literally every single resource
+ * load throughout the game's lifetime, not just boot.
+ *
+ * There is no way to get a std::shared_future without a promise/future
+ * shared state somewhere underneath it, so the fix here is to never let
+ * that state's destructor run on the coroutine's stack: keep every
+ * completed promise alive indefinitely instead of letting it go out of
+ * scope. This is a deliberate, unbounded leak (~100-200 bytes per resource
+ * load) - real but slow relative to Vita's 256MiB heap, and clearing it
+ * safely would mean draining this list from the main thread's real stack
+ * on a frame boundary, which is a larger change than justified while this
+ * is still the first-order blocker to booting at all. Revisit if a long
+ * play session's leaked total becomes an actual problem. */
+static std::vector<std::shared_ptr<void>> sVitaLeakedResourcePromises;
+#endif
+
 ResourceFilter::ResourceFilter(const std::list<std::string>& includeMasks, const std::list<std::string>& excludeMasks,
                                const uintptr_t owner, const std::shared_ptr<Archive> parent)
     : IncludeMasks(includeMasks), ExcludeMasks(excludeMasks), Owner(owner), Parent(parent) {
@@ -70,6 +99,19 @@ void ResourceManager::Init(const std::vector<std::string>& archivePaths,
     // instead of submitting to mThreadPool, so the pool itself is never
     // used there and isn't created at all.
     (void)reservedThreadCount;
+    /* Real-hardware testing traced a crash to pte_mutex_check_need_init
+     * (VitaSDK's pthread-embedded mutex, lazily creating its underlying
+     * kernel object on first lock()) inside CheckCache()'s mMutex lock -
+     * the same "syscall from the game coroutine's manually swapped stack
+     * faults on real hardware" bug as everywhere else in docs/bugs/. A
+     * pre-warm-on-main-thread workaround was tried here first; confirmed
+     * with the original author of this port's Vita rendering layer
+     * (Rinnegatamante) that his own working fork doesn't use a mutex in
+     * ResourceManager at all - Vita resource loading is single-threaded
+     * through the game coroutine, so there's no real concurrent access to
+     * protect against in the first place. mMutex's three lock sites
+     * (CheckCache, LoadResourceProcess, UnloadResource) are now skipped
+     * entirely on Vita instead of pre-warmed. */
 #else
     // the extra `- 1` is because we reserve an extra thread for spdlog
     size_t threadCount = std::max(1, (int32_t)(std::thread::hardware_concurrency() - reservedThreadCount - 1));
@@ -180,7 +222,9 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     cachedResource = GetCachedResource(identifier, true);
 
     {
+#ifndef __vita__
         const std::lock_guard<std::mutex> lock(mMutex);
+#endif
 
         if (cachedResource != nullptr) {
             // If another thread has already loaded this resource, discard the work we already did and return from
@@ -224,7 +268,11 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
     if (cacheCheck) {
         auto promise = std::make_shared<std::promise<std::shared_ptr<IResource>>>();
         promise->set_value(cacheCheck);
-        return promise->get_future().share();
+        auto future = promise->get_future().share();
+#ifdef __vita__
+        sVitaLeakedResourcePromises.push_back(promise);
+#endif
+        return future;
     }
 
 #ifdef __vita__
@@ -241,7 +289,9 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
     // needs to change.
     auto promise = std::make_shared<std::promise<std::shared_ptr<IResource>>>();
     promise->set_value(LoadResourceProcess(identifier, loadExact, initData));
-    return promise->get_future().share();
+    auto future = promise->get_future().share();
+    sVitaLeakedResourcePromises.push_back(promise);
+    return future;
 #else
     return mThreadPool->submit_task(
         [this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
@@ -295,7 +345,9 @@ ResourceManager::CheckCache(const ResourceIdentifier& identifier, bool loadExact
         }
     }
 
+#ifndef __vita__
     const std::lock_guard<std::mutex> lock(mMutex);
+#endif
 
     auto cacheFind = mResourceCache.find(identifier);
     if (cacheFind == mResourceCache.end()) {
@@ -365,7 +417,9 @@ ResourceManager::LoadResourcesAsync(const ResourceFilter& filter, BS::priority_t
     // See LoadResourceAsync's comment above - no thread pool on Vita.
     auto promise = std::make_shared<std::promise<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>>();
     promise->set_value(LoadResourcesProcess(filter));
-    return promise->get_future().share();
+    auto future = promise->get_future().share();
+    sVitaLeakedResourcePromises.push_back(promise);
+    return future;
 #else
     return mThreadPool->submit_task(
         [this, filter]() -> std::shared_ptr<std::vector<std::shared_ptr<IResource>>> {
@@ -459,7 +513,9 @@ size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
     size_t ret = 0;
     // We can only erase the resource if we have any resources for that owner.
     if (mResourceCache.contains(identifier)) {
+#ifndef __vita__
         const std::lock_guard<std::mutex> lock(mMutex);
+#endif
         mResourceCache.erase(identifier);
     }
 

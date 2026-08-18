@@ -19,6 +19,21 @@ ResourceFactoryBinaryBlobV0::ReadResource(std::shared_ptr<Ship::File> file,
     // (e.g. compressed MIDI parser). Large audio DMA overreads are handled by
     // AudioDma_Clamp in osPiStartDma instead.
     constexpr uint32_t kBlobPadding = 16;
+#ifdef __vita__
+    /* Real-hardware testing hit a crash reading this loop one byte at a
+     * time via ReadUByte()/push_back() - PC landed inside trivial pointer
+     * accessors (shared_ptr::get(), vector::size()) on MemoryStream's
+     * underlying buffer, which can only fault if that object itself is a
+     * wild/dangling pointer - confirmed independent of the earlier spdlog
+     * async-logger crash this session also found and fixed (see
+     * docs/bugs/). A single bulk Read() call instead of dataSize separate
+     * ReadUByte() calls avoids whatever specific interaction triggers it,
+     * and is also the correct fix on its own merits. */
+    blob->Data.resize(dataSize + kBlobPadding, 0);
+    if (dataSize > 0) {
+        reader->Read(blob->Data.data(), (int32_t)dataSize);
+    }
+#else
     blob->Data.reserve(dataSize + kBlobPadding);
 
     for (uint32_t i = 0; i < dataSize; i++) {
@@ -26,6 +41,7 @@ ResourceFactoryBinaryBlobV0::ReadResource(std::shared_ptr<Ship::File> file,
     }
 
     blob->Data.resize(dataSize + kBlobPadding, 0);
+#endif
 
     return blob;
 }
