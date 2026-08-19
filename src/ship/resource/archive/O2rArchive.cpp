@@ -6,11 +6,14 @@
 
 #ifdef __vita__
 #include <algorithm>
+#include <cstdarg>
 #include <cstring>
 #include <malloc.h>
+#include <zlib.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
+#include "coroutine.h"
 #include "port_log.h"
 #endif
 
@@ -18,6 +21,41 @@ namespace Ship {
 
 #ifdef __vita__
 #include <cstdio>
+
+/* TEMPORARY DIAGNOSTIC helper: port_log()'s normal async queue can lose its
+ * last message if a crash happens before the dedicated writer thread gets
+ * scheduled - confirmed repeatedly this session, right when it mattered
+ * most (the message immediately preceding a crash). A direct, synchronous
+ * sceClibPrintf would fix that, but is only safe to call from the real
+ * thread stack, never from inside the coroutine (see
+ * docs/../02-vitasdk/04-kernel-core-apis.md's "manually-swapped stacks"
+ * finding - any raw kernel syscall from the coroutine can crash on real
+ * hardware, and sceClibPrintf is exactly that kind of call). Archive
+ * loading during initial boot (Open()/the first LoadFile() calls) happens
+ * on the real thread, before the coroutine exists - port_coroutine_in_coroutine()
+ * tells us which context we're in at the call site, so this only takes the
+ * synchronous path when it's actually safe to. */
+static void ArchDiagLog(const char* fmt, ...) {
+    /* sceClibVsnprintf, not newlib's vsnprintf: a real-hardware crash landed
+     * *inside* newlib's _svfprintf_r the first time this function used
+     * vsnprintf from within the coroutine - matching this exact session's
+     * already-established pattern (newlib's stdio internals carry their own
+     * lazily-created lock, same class of bug as malloc/memalign - see
+     * 02-vitasdk/04-kernel-core-apis.md's coroutine section). Sony's own
+     * sceClibVsnprintf bypasses newlib's stdio layer entirely - same
+     * "avoid newlib stdio" convention this project's own port_log.c already
+     * established for file/console output, just applied to formatting too. */
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    sceClibVsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    port_log("%s", buf);
+    if (!port_coroutine_in_coroutine()) {
+        sceClibPrintf("%s", buf);
+    }
+}
 
 /* VitaSDK's prebuilt zlib 1.3.2 compiles inflate()/inflate_fast() with real
  * ARM NEON vld1/vst1 instructions (confirmed via objdump on
@@ -86,6 +124,29 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         return nullptr;
     }
 
+#ifdef __vita__
+    /* TEMPORARY DIAGNOSTIC: corruption-hunting. Re-checksum the archive's
+     * real (unpadded) bytes on every single LoadFile() call, before doing
+     * anything else, and compare against the baseline taken once in Open().
+     * libzip only ever reads from this buffer (see Open()'s "freep = 0"
+     * comment) - it is never itself the writer - so any mismatch here means
+     * something OUTSIDE libzip/zlib wrote into this memory region between
+     * Open() and this call. This runs on every call specifically so that,
+     * if it ever fires, the *previous* successful call and *this* one
+     * bracket the window the corruption happened in - the goal is finding
+     * that window, not the specific bug yet. Cheap relative to the
+     * decompression this function is about to do anyway; left in place
+     * across all calls rather than sampled, since the corruption is
+     * non-deterministic and sampling could miss the one call that matters. */
+    uint32_t currentCrc = (uint32_t)crc32(0L, mArchiveBuffer.data(), (uInt)mArchiveBufferRealSize);
+    if (currentCrc != mArchiveBufferBaselineCrc) {
+        ArchDiagLog("SSB64: ARCHDIAG *** CORRUPTION DETECTED *** archive=%s requesting=%s "
+                 "baseline_crc=%08x current_crc=%08x size=%zu\n",
+                 GetPath().c_str(), filePath.c_str(), (unsigned int)mArchiveBufferBaselineCrc,
+                 (unsigned int)currentCrc, mArchiveBufferRealSize);
+    }
+#endif
+
     auto zipEntryIndex = zip_name_locate(mZipArchive, filePath.c_str(), 0);
     if (zipEntryIndex < 0) {
         SPDLOG_TRACE("Failed to find file {} in zip archive  {}.", filePath, GetPath());
@@ -113,7 +174,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
      * unreachable dead code by the time the crash happened. port_log queues
      * to an async writer thread and does no syscalls itself, so it's safe to
      * call from here regardless of what happens below. */
-    port_log("SSB64: ARCHDIAG LoadFile path=%s size=%llu compsize=%llu compmethod=%u\n", filePath.c_str(),
+    ArchDiagLog("SSB64: ARCHDIAG LoadFile path=%s size=%llu compsize=%llu compmethod=%u\n", filePath.c_str(),
              (unsigned long long)zipEntryStat.size, (unsigned long long)zipEntryStat.comp_size,
              (unsigned int)zipEntryStat.comp_method);
 #endif
@@ -167,9 +228,42 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
      * depth varying as much as it always has, so this reversion is for a
      * clean baseline to test the alignment hypothesis against, not a
      * confirmed-safe verdict either way. If revisiting, test in isolation
-     * (a minimal reproduction, not a full boot chain) before redeploying. */
-    std::vector<char> vitaReadScratch(zipEntryStat.size + (64 * 1024), 0);
-    if (vitaReadScratch.data() == nullptr) {
+     * (a minimal reproduction, not a full boot chain) before redeploying.
+     *
+     * NOT a fresh per-call allocation anymore: a function-local static pool,
+     * grown on demand and never shrunk. Real-hardware testing traced a
+     * separate, still-recurring crash (crc32_z, non-deterministic exact
+     * location) to newlib malloc's mmap_chunk() path, taken for any single
+     * allocation big enough to cross DEFAULT_MMAP_THRESHOLD (128 KiB) -
+     * unlike ordinary sbrk-backed allocations (a one-time kernel cost at
+     * startup), mmap_chunk() makes a fresh kernel call on *every* qualifying
+     * request (see port.cpp's mallopt comment - this project's own audio
+     * assets routinely exceed 128 KiB, one wavetable blob runs ~1 MB), and
+     * that kernel call crashes when made from the game coroutine's
+     * manually-swapped stack, the same as every other kernel syscall from
+     * that context this session found. Confirmed NOT fixable by pre-warming
+     * (a fresh call is still a fresh kernel call, unlike a one-time lazy
+     * lock) and the M_MMAP_THRESHOLD tunable set in port.cpp's main() is
+     * itself confirmed not fully reliable on this newlib build. Reusing one
+     * pool sidesteps the problem differently: once it's grown large enough
+     * (which happens here on the real thread, since this function's very
+     * first call - loading this archive's own "version" entry - runs
+     * before any coroutine exists), later calls for equal-or-smaller data
+     * never need a fresh allocation at all, regardless of which thread
+     * context they run in. A function-local static's first-use
+     * initialization is itself thread-safety-guarded by the compiler
+     * ("magic statics") - relying on that guard already being satisfied by
+     * this same real-thread "version" call, rather than re-deriving
+     * safety here, since a fresh magic-static guard's own lazy lock
+     * creation would otherwise be exactly one more instance of this
+     * session's "first use from the coroutine" pattern. */
+    static std::vector<char> sVitaReadScratchPool;
+    const size_t neededSize = zipEntryStat.size + (64 * 1024);
+    if (sVitaReadScratchPool.size() < neededSize) {
+        sVitaReadScratchPool.resize(neededSize, 0);
+    }
+    char* vitaReadScratch = sVitaReadScratchPool.data();
+    if (vitaReadScratch == nullptr) {
         SPDLOG_TRACE("Failed to allocate aligned read buffer for {} in zip archive {}.", filePath, GetPath());
         return nullptr;
     }
@@ -202,19 +296,60 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 #endif
 
 #ifdef __vita__
-    if (zip_fread(zipEntryFile, vitaReadScratch.data(), zipEntryStat.size) < 0) {
+    if (zip_fread(zipEntryFile, vitaReadScratch, zipEntryStat.size) < 0) {
         SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
     }
-    std::memcpy(fileToLoad->Buffer->data(), vitaReadScratch.data(), zipEntryStat.size);
+    std::memcpy(fileToLoad->Buffer->data(), vitaReadScratch, zipEntryStat.size);
+
+    /* TEMPORARY DIAGNOSTIC: per-resource output fingerprint, for comparing
+     * the same asset's decompressed content across separate runs (a
+     * fingerprint that differs for the same file between two runs is
+     * direct proof of non-deterministic corruption, independent of
+     * whether either run actually crashed). Only reached when zip_fread
+     * above didn't crash/corrupt this call outright - the input-buffer
+     * check above this function catches the case where corruption already
+     * happened before this call started. */
+    {
+        uint32_t outCrc = (uint32_t)crc32(0L, (const Bytef*)fileToLoad->Buffer->data(), (uInt)zipEntryStat.size);
+        size_t headLen = std::min<size_t>(16, zipEntryStat.size);
+        size_t tailLen = std::min<size_t>(16, zipEntryStat.size);
+        const unsigned char* bufBytes = (const unsigned char*)fileToLoad->Buffer->data();
+        char headHex[16 * 2 + 1] = {0};
+        char tailHex[16 * 2 + 1] = {0};
+        for (size_t i = 0; i < headLen; i++) {
+            sceClibSnprintf(headHex + i * 2, 3, "%02x", bufBytes[i]);
+        }
+        for (size_t i = 0; i < tailLen; i++) {
+            sceClibSnprintf(tailHex + i * 2, 3, "%02x", bufBytes[zipEntryStat.size - tailLen + i]);
+        }
+        ArchDiagLog("SSB64: ARCHDIAG BUF file=%s size=%llu crc=%08x head=%s tail=%s\n", filePath.c_str(),
+                 (unsigned long long)zipEntryStat.size, (unsigned int)outCrc, headHex, tailHex);
+    }
 #else
     if (zip_fread(zipEntryFile, fileToLoad->Buffer->data(), zipEntryStat.size) < 0) {
         SPDLOG_TRACE("Error reading file {} in zip archive  {}.", filePath, GetPath());
     }
 #endif
 
+#ifdef __vita__
+    /* TEMPORARY DIAGNOSTIC: bisecting whether the recurring crc32_z crash
+     * happens inside zip_fread's decompression (above, already confirmed
+     * to complete - the BUF fingerprint log above this point is proof) or
+     * inside zip_fclose() specifically - libzip verifies the entry's
+     * stored CRC-32 against the just-decompressed data as part of closing
+     * it, which is itself a crc32_z call, separate from our own fingerprint
+     * crc32() call above. If this line is consistently missing from a run
+     * that crashed in crc32_z while the BUF line above it consistently
+     * isn't, that pinpoints zip_fclose()'s internal verification as the
+     * culprit call site. */
+    ArchDiagLog("SSB64: ARCHDIAG about to zip_fclose file=%s\n", filePath.c_str());
+#endif
     if (zip_fclose(zipEntryFile) != 0) {
         SPDLOG_TRACE("Error closing file {} in zip archive  {}.", filePath, GetPath());
     }
+#ifdef __vita__
+    ArchDiagLog("SSB64: ARCHDIAG zip_fclose done file=%s\n", filePath.c_str());
+#endif
 
     fileToLoad->IsLoaded = true;
 
@@ -311,6 +446,19 @@ bool O2rArchive::Open() {
      * vtable, consistent with the ~12 MB memalign() overlapping live heap
      * memory) - see O2rArchive.h's mArchiveBuffer comment. */
     const size_t kRealSize = mArchiveBuffer.size();
+
+    /* TEMPORARY DIAGNOSTIC: corruption-hunting baseline. Checksum the real
+     * (as-read-from-disk) bytes now, before any padding/decompression
+     * touches anything, so LoadFile() can detect if this buffer's content
+     * ever changes after this point - libzip's in-memory source treats it
+     * as read-only, so any change here can only mean something outside
+     * libzip wrote into this memory region. See LoadFile() for the other
+     * half of this check. */
+    mArchiveBufferRealSize = kRealSize;
+    mArchiveBufferBaselineCrc = (uint32_t)crc32(0L, mArchiveBuffer.data(), (uInt)kRealSize);
+    ArchDiagLog("SSB64: ARCHDIAG baseline CRC for %s: size=%zu crc=%08x\n", GetPath().c_str(), kRealSize,
+             (unsigned int)mArchiveBufferBaselineCrc);
+
     mArchiveBuffer.resize(kRealSize + (64 * 1024), 0);
 
     zip_error_t zipErr;

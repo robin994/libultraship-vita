@@ -47,5 +47,17 @@ class O2rArchive final : virtual public Archive {
      * meant to fix). If NEON alignment turns out to matter for the archive
      * source buffer too, revisit with a smaller/isolated test first. */
     std::vector<uint8_t> mArchiveBuffer;
+
+#ifdef __vita__
+    /* TEMPORARY DIAGNOSTIC: corruption-hunting per the "prove zlib is a
+     * victim, not a culprit" strategy - see LoadFile()'s use of these in
+     * O2rArchive.cpp for the full explanation. A checksum of
+     * mArchiveBuffer's real (unpadded) bytes taken once at Open() time,
+     * re-checked on every LoadFile() call; mRealSize is the span that
+     * checksum covers (mArchiveBuffer.size() includes Open()'s trailing
+     * padding, which isn't part of the real file and must be excluded). */
+    uint32_t mArchiveBufferBaselineCrc = 0;
+    size_t mArchiveBufferRealSize = 0;
+#endif
 };
 } // namespace Ship
