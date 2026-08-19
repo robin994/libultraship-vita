@@ -36,16 +36,15 @@ namespace Ship {
  * tells us which context we're in at the call site, so this only takes the
  * synchronous path when it's actually safe to. */
 static void ArchDiagLog(const char* fmt, ...) {
-    /* Disabled: this was the per-resource CRC/fingerprint logging built for
-     * the coroutine-kernel-syscall crash investigation (see the wiki's
-     * "manually-swapped stacks" finding and the SceFiber migration that
-     * fixed the underlying bug). That investigation is done; every call
-     * site below is left in place, still validated by the compiler, in
-     * case a similar buffer-corruption hunt is needed again - just
-     * uncomment the body below (and keep the sceClibVsnprintf/
-     * port_coroutine_in_coroutine() split, both still load-bearing for the
-     * reasons in the comment this replaced) rather than re-adding the call
-     * sites from scratch.
+    /* Disabled again (2026-08-19): the earlier "hang" this was re-enabled
+     * to chase turned out not to be a hang at all (just this same logging
+     * being quiet - see the investigation history), so it's not needed for
+     * that anymore. Per-resource CRC/fingerprint logging on every single
+     * archive read (hundreds of files during character-roster load) has a
+     * real, measurable cost and was slowing the app down during the
+     * current shader-compile-failure investigation, which doesn't need
+     * it. Single point of control, as before - uncomment the body if a
+     * similar buffer-corruption hunt is needed again:
      *
      * char buf[512];
      * va_list ap;
