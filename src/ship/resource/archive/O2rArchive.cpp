@@ -36,25 +36,29 @@ namespace Ship {
  * tells us which context we're in at the call site, so this only takes the
  * synchronous path when it's actually safe to. */
 static void ArchDiagLog(const char* fmt, ...) {
-    /* sceClibVsnprintf, not newlib's vsnprintf: a real-hardware crash landed
-     * *inside* newlib's _svfprintf_r the first time this function used
-     * vsnprintf from within the coroutine - matching this exact session's
-     * already-established pattern (newlib's stdio internals carry their own
-     * lazily-created lock, same class of bug as malloc/memalign - see
-     * 02-vitasdk/04-kernel-core-apis.md's coroutine section). Sony's own
-     * sceClibVsnprintf bypasses newlib's stdio layer entirely - same
-     * "avoid newlib stdio" convention this project's own port_log.c already
-     * established for file/console output, just applied to formatting too. */
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    sceClibVsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
-    port_log("%s", buf);
-    if (!port_coroutine_in_coroutine()) {
-        sceClibPrintf("%s", buf);
-    }
+    /* Disabled: this was the per-resource CRC/fingerprint logging built for
+     * the coroutine-kernel-syscall crash investigation (see the wiki's
+     * "manually-swapped stacks" finding and the SceFiber migration that
+     * fixed the underlying bug). That investigation is done; every call
+     * site below is left in place, still validated by the compiler, in
+     * case a similar buffer-corruption hunt is needed again - just
+     * uncomment the body below (and keep the sceClibVsnprintf/
+     * port_coroutine_in_coroutine() split, both still load-bearing for the
+     * reasons in the comment this replaced) rather than re-adding the call
+     * sites from scratch.
+     *
+     * char buf[512];
+     * va_list ap;
+     * va_start(ap, fmt);
+     * sceClibVsnprintf(buf, sizeof(buf), fmt, ap);
+     * va_end(ap);
+     *
+     * port_log("%s", buf);
+     * if (!port_coroutine_in_coroutine()) {
+     *     sceClibPrintf("%s", buf);
+     * }
+     */
+    (void)fmt;
 }
 
 /* VitaSDK's prebuilt zlib 1.3.2 compiles inflate()/inflate_fast() with real
