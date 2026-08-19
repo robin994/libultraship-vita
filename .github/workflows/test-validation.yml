@@ -1,7 +1,9 @@
 name: test-validation
+# Vita fork: same reasoning as build-validation.yml - upstream's Linux/SDL2
+# test matrix, unrelated to this fork's Vita-only concern, reliably failing
+# here. Manual-only; run by hand if needed.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

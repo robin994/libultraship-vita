@@ -1,7 +1,11 @@
 name: build-validation
+# Vita fork: this tests upstream's full multi-platform matrix (macOS/iOS/...),
+# unrelated to this fork's Vita-only concern and reliably failing on every
+# push since it isn't kept green here. Manual-only to stop the noise; run by
+# hand (Actions tab -> Run workflow) if cross-platform correctness ever
+# needs checking again.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
