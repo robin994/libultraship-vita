@@ -447,7 +447,10 @@ typedef enum {
 } vglMemType;
 extern "C" {
 void *vglAllocFromScratch(size_t size);
+void *vglForceAlloc(uint32_t size);
 void vglFree(void*);
+size_t vglMemFree(vglMemType type);
+void port_log(const char *fmt, ...);
 void vglSetParamBufferSize(uint32_t size);
 void vglUseTripleBuffering(uint8_t usage);
 uint8_t vglInitWithCustomThreshold(int pool_size, int width, int height, int ram_threshold, int cdram_threshold, int phycont_threshold, int cdlg_threshold, SceGxmMultisampleMode msaa);
@@ -538,8 +541,49 @@ Interpreter::Interpreter() {
      * standard vitaGL memory-pressure knobs on this platform. Must be set
      * before vglInitWithCustomThreshold, which reads it during setup. */
     vglUseTripleBuffering(0 /* GL_FALSE - not in scope here, double-buffer */);
-    vglInitWithCustomThreshold(0, 960, 544, 4 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_4X);
-    mBufVbo = (float *)vglAllocFromScratch(10 * 1024 * 1024);
+    /* ram_threshold is how much system RAM vitaGL LEAVES UNCLAIMED, not how
+     * much it takes (see vglInitWithCustomThreshold: it claims
+     * size_user - ram_threshold). The old 4MB was far more aggressive than
+     * vitaGL's own default of 16MB, and real-hardware measurement showed the
+     * consequence: at the point every Fast3D shader started failing to
+     * compile, the kernel had only 2MB of user memory and ZERO cdram/phycont
+     * free, and newlib's heap was down to ~4KB free out of a 141MB arena.
+     * SceShaccCg (libshacccg.suprx) needs to allocate a compiler workspace
+     * to translate each shader, and with the whole system that starved it
+     * fails with a generic "fatal internal error on line -1" - which is what
+     * sent this investigation chasing shader source bugs for a long time.
+     * Leaving 32MB unclaimed gives the runtime compiler room to work; the
+     * VRAM/CDRAM pool measured 39-92MB free throughout, so vitaGL's own
+     * allocations have plenty of fallback headroom (vglMalloc walks
+     * RAM -> SLOW -> BUDGET -> VRAM). */
+    vglInitWithCustomThreshold(0, 960, 544, 32 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_4X);
+    /* Baseline memory reading, before the game loads any assets - pairs with
+     * the same reading logged at shader-link failure in gfx_opengl.cpp, so
+     * the two together show how much headroom vitaGL actually starts with
+     * and how much is left by the time shader compilation starts failing. */
+    port_log("SSB64: vitaGL pools after init | free vram=%u ram=%u slow=%u budget=%u ext=%u\n",
+             (unsigned int)vglMemFree(VGL_MEM_VRAM), (unsigned int)vglMemFree(VGL_MEM_RAM),
+             (unsigned int)vglMemFree(VGL_MEM_SLOW), (unsigned int)vglMemFree(VGL_MEM_BUDGET),
+             (unsigned int)vglMemFree(VGL_MEM_EXTERNAL));
+    /* NOT vglAllocFromScratch: that maps to gpu_alloc_mapped_temp, which is
+     * vitaGL's *temporary* allocator - it either marks the block dirty for
+     * the garbage collector or hands out a slice of the circular data pool
+     * that is recycled every frame. mBufVbo is the vertex buffer Fast3D
+     * writes geometry into and keeps for the entire process lifetime, so
+     * holding temp memory here meant (a) the vertex data could be recycled
+     * out from under the renderer mid-frame, and (b) 10MB was permanently
+     * squatting in the circular pool, which real-hardware logs showed
+     * thrashing badly: 87 failed 10MB allocations, each recovered only by
+     * forcing 4 garbage collection cycles, which in turn starved
+     * SceShaccCg and made every runtime shader compile fail. vglForceAlloc
+     * (gpu_alloc_mapped_for_cpu) is the persistent GPU-mapped CPU-writable
+     * allocator - the correct one for a buffer with this lifetime. */
+    mBufVbo = (float *)vglForceAlloc(10 * 1024 * 1024);
+    port_log("SSB64: mBufVbo persistent alloc = %p\n", (void *)mBufVbo);
+    port_log("SSB64: vitaGL pools after 10MB scratch | free vram=%u ram=%u slow=%u budget=%u ext=%u\n",
+             (unsigned int)vglMemFree(VGL_MEM_VRAM), (unsigned int)vglMemFree(VGL_MEM_RAM),
+             (unsigned int)vglMemFree(VGL_MEM_SLOW), (unsigned int)vglMemFree(VGL_MEM_BUDGET),
+             (unsigned int)vglMemFree(VGL_MEM_EXTERNAL));
 #else
     mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
 #endif

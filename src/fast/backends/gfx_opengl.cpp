@@ -35,8 +35,19 @@
 
 #ifdef __vita__
 #include <psp2/gxm.h>
+#include <psp2/kernel/sysmem.h>
+#include <malloc.h>
 #include "port_log.h"
+typedef enum {
+    VGL_MEM_VRAM,
+    VGL_MEM_RAM,
+    VGL_MEM_SLOW,
+    VGL_MEM_BUDGET,
+    VGL_MEM_EXTERNAL,
+    VGL_MEM_ALL
+} vglMemType;
 extern "C" {
+    size_t vglMemFree(vglMemType type);
     void vglBufferData(GLenum target, const GLvoid *data);
     // vitaGL implements glAttachShader/glCompileShader/glCreateShader/
     // glDeleteShader/glLinkProgram but not glDetachShader. imgui's OpenGL3
@@ -727,8 +738,34 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         GLint link_status = GL_FALSE;
         glGetProgramiv(shader_program, GL_LINK_STATUS, &link_status);
         if (!link_status) {
-            port_log("SSB64: shader link failed, shader_id0=%016llX shader_id1=%016llX\n",
-                      (unsigned long long)shader_id0, (unsigned long long)shader_id1);
+            /* Log vitaGL's per-pool free memory alongside the failure:
+             * ux0:data/vitaGL.log shows SceShaccCg failing with a generic
+             * "fatal internal error" while gpu_alloc_mapped_aligned_for_cpu
+             * is simultaneously failing 10MB requests and forcing GC cycles,
+             * so the working hypothesis is memory exhaustion rather than a
+             * bad shader. This turns that from inference into a measurement. */
+            /* vglMemFree(VGL_MEM_EXTERNAL) is a hardcoded 0 in vitaGL and says
+             * nothing about newlib, but newlib is exactly the pool vglMalloc
+             * (and therefore SceShaccCg, via shark_set_allocators) tries
+             * FIRST - so report it directly via mallinfo, plus the kernel's
+             * own free-memory view, to identify which pool is actually
+             * starved when the compiler fails. */
+            struct mallinfo mi = mallinfo();
+            SceKernelFreeMemorySizeInfo kinfo;
+            kinfo.size = sizeof(kinfo);
+            sceKernelGetFreeMemorySize(&kinfo);
+            port_log("SSB64: shader link failed, shader_id0=%016llX shader_id1=%016llX "
+                     "| vgl vram=%u ram=%u slow=%u budget=%u "
+                     "| newlib arena=%u free=%u used=%u "
+                     "| kernel user=%u cdram=%u phycont=%u\n",
+                      (unsigned long long)shader_id0, (unsigned long long)shader_id1,
+                      (unsigned int)vglMemFree(VGL_MEM_VRAM),
+                      (unsigned int)vglMemFree(VGL_MEM_RAM),
+                      (unsigned int)vglMemFree(VGL_MEM_SLOW),
+                      (unsigned int)vglMemFree(VGL_MEM_BUDGET),
+                      (unsigned int)mi.arena, (unsigned int)mi.fordblks, (unsigned int)mi.uordblks,
+                      (unsigned int)kinfo.size_user, (unsigned int)kinfo.size_cdram,
+                      (unsigned int)kinfo.size_phycont);
             glDeleteShader(vertex_shader);
             glDeleteShader(fragment_shader);
             glDeleteProgram(shader_program);
