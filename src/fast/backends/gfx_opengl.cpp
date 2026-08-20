@@ -35,6 +35,7 @@
 
 #ifdef __vita__
 #include <psp2/gxm.h>
+#include "port_log.h"
 extern "C" {
     void vglBufferData(GLenum target, const GLvoid *data);
     // vitaGL implements glAttachShader/glCompileShader/glCreateShader/
@@ -621,6 +622,22 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     GLint success;
 
 #ifdef __vita__
+    /* FOLLOW-UP (2026-08-20, not addressed in this pass): this whole cache
+     * - read below and write further down, after glLinkProgram() - uses
+     * plain stdio (fopen/fseek/fread/fwrite) synchronously, called from
+     * whatever context CreateAndLoadNewShader() runs in (the rendering
+     * coroutine during normal gameplay). Also: the read path trusts the
+     * cached file's size/content outright (file_size - sizeof(size_t) is
+     * used for the malloc()/fread() length with no sanity check against a
+     * minimum size, no validation that glProgramBinary() actually accepted
+     * it, no version/hash tie to the shader source that produced it), and
+     * the write path (below) had no link-success check before this pass -
+     * now gated on the GL_LINK_STATUS check added below, but a corrupted or
+     * truncated cache file written some other way - e.g. a crash mid-fwrite
+     * - would still be trusted blindly on the next read. Candidate for both
+     * slowness (synchronous file I/O on the render path) and instability
+     * (unvalidated cache blob feeding glProgramBinary()), but changing the
+     * cache mechanism itself is out of scope for this pass. */
     GLuint shader_program = 0;
     int prog_size = 0, prog_len = 0;
     unsigned int prog_format = 0;
@@ -684,6 +701,30 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         glLinkProgram(shader_program);
 
 #ifdef __vita__
+        /* On Vita, vitaGL compiles in VGL_MODE_POSTPONED: the actual
+         * SceShaccCg compile happens inside glLinkProgram(), not at the
+         * glCompileShader() calls above (those just stash the source). The
+         * GL_COMPILE_STATUS checks above this point can't see a runtime
+         * compiler failure - only GL_LINK_STATUS here can. A failed compile
+         * is a known, real-hardware-confirmed occurrence for some shaders
+         * (SceShaccCg internal compiler error) - without this check, the
+         * caller went on to use an invalid/unlinked shader_program, and
+         * vitaGL's own glLinkProgram() previously did the same unchecked,
+         * which data-aborted inside SceGxm (see Makefile.vita's vitaGL
+         * section for that root cause). Bail out here instead: log, clean
+         * up the GL objects, and return nullptr so the caller can skip this
+         * draw rather than crash the whole process. */
+        GLint link_status = GL_FALSE;
+        glGetProgramiv(shader_program, GL_LINK_STATUS, &link_status);
+        if (!link_status) {
+            port_log("SSB64: shader link failed, shader_id0=%016llX shader_id1=%016llX\n",
+                      (unsigned long long)shader_id0, (unsigned long long)shader_id1);
+            glDeleteShader(vertex_shader);
+            glDeleteShader(fragment_shader);
+            glDeleteProgram(shader_program);
+            return nullptr;
+        }
+
         f = fopen(fname, "wb");
         if (f) {
             glGetProgramiv(shader_program, GL_PROGRAM_BINARY_LENGTH, &prog_size);

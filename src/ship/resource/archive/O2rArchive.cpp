@@ -22,6 +22,20 @@ namespace Ship {
 #ifdef __vita__
 #include <cstdio>
 
+/* Corruption-hunting diagnostic, OFF by default (2026-08-20): re-checksums
+ * the archive's real bytes (baseline once in Open(), then again on every
+ * single LoadFile() call to compare) to catch something outside libzip
+ * writing into mArchiveBuffer. With ArchDiagLog() already a no-op, the
+ * baseline compute is a one-time ~12MB scan (cheap), but the per-LoadFile()
+ * scan is not - it re-scans the same ~12MB BattleShip.o2r buffer for every
+ * single resource load (hundreds of calls during character-roster load
+ * alone), which is a real, measurable cost with no diagnostic output to
+ * show for it while this is off. Define to 1 to re-enable if hunting this
+ * specific corruption bug again. */
+#ifndef SSB64_ARCHIVE_CRC_DIAGNOSTIC
+#define SSB64_ARCHIVE_CRC_DIAGNOSTIC 0
+#endif
+
 /* TEMPORARY DIAGNOSTIC helper: port_log()'s normal async queue can lose its
  * last message if a crash happens before the dedicated writer thread gets
  * scheduled - confirmed repeatedly this session, right when it mattered
@@ -127,7 +141,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         return nullptr;
     }
 
-#ifdef __vita__
+#if defined(__vita__) && SSB64_ARCHIVE_CRC_DIAGNOSTIC
     /* TEMPORARY DIAGNOSTIC: corruption-hunting. Re-checksum the archive's
      * real (unpadded) bytes on every single LoadFile() call, before doing
      * anything else, and compare against the baseline taken once in Open().
@@ -137,10 +151,9 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
      * Open() and this call. This runs on every call specifically so that,
      * if it ever fires, the *previous* successful call and *this* one
      * bracket the window the corruption happened in - the goal is finding
-     * that window, not the specific bug yet. Cheap relative to the
-     * decompression this function is about to do anyway; left in place
-     * across all calls rather than sampled, since the corruption is
-     * non-deterministic and sampling could miss the one call that matters. */
+     * that window, not the specific bug yet. Off by default: scanning the
+     * whole ~12MB archive buffer on every single resource load is a real,
+     * measurable cost - see SSB64_ARCHIVE_CRC_DIAGNOSTIC above. */
     uint32_t currentCrc = (uint32_t)crc32(0L, mArchiveBuffer.data(), (uInt)mArchiveBufferRealSize);
     if (currentCrc != mArchiveBufferBaselineCrc) {
         ArchDiagLog("SSB64: ARCHDIAG *** CORRUPTION DETECTED *** archive=%s requesting=%s "
@@ -450,17 +463,22 @@ bool O2rArchive::Open() {
      * memory) - see O2rArchive.h's mArchiveBuffer comment. */
     const size_t kRealSize = mArchiveBuffer.size();
 
+#if SSB64_ARCHIVE_CRC_DIAGNOSTIC
     /* TEMPORARY DIAGNOSTIC: corruption-hunting baseline. Checksum the real
      * (as-read-from-disk) bytes now, before any padding/decompression
      * touches anything, so LoadFile() can detect if this buffer's content
      * ever changes after this point - libzip's in-memory source treats it
      * as read-only, so any change here can only mean something outside
      * libzip wrote into this memory region. See LoadFile() for the other
-     * half of this check. */
+     * half of this check. Only computed when the diagnostic is enabled -
+     * see SSB64_ARCHIVE_CRC_DIAGNOSTIC above; the corresponding per-LoadFile()
+     * check is what actually costs anything on every boot, but there's no
+     * point paying even this one-time scan when that check is compiled out. */
     mArchiveBufferRealSize = kRealSize;
     mArchiveBufferBaselineCrc = (uint32_t)crc32(0L, mArchiveBuffer.data(), (uInt)kRealSize);
     ArchDiagLog("SSB64: ARCHDIAG baseline CRC for %s: size=%zu crc=%08x\n", GetPath().c_str(), kRealSize,
              (unsigned int)mArchiveBufferBaselineCrc);
+#endif
 
     mArchiveBuffer.resize(kRealSize + (64 * 1024), 0);
 
