@@ -35,6 +35,7 @@
 
 #ifdef __vita__
 #include <psp2/gxm.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <malloc.h>
 #include "port_log.h"
@@ -60,20 +61,44 @@ extern "C" {
         (void)shader;
     }
 };
-#define SHADER_MAGIC (1)
+#define SHADER_MAGIC (2)
+#define SSB64_VITA_PROGRAM_BINARY_CACHE 1
 
-/* Disabled (2026-08-20): a real-hardware coredump showed a data abort
- * inside vitaGL's glProgramBinary(), called from this manual on-disk
- * program-binary cache's read path (CreateAndLoadNewShader() below), fault
- * address 0x0 - a NULL/garbage binary blob fed straight into glProgramBinary()
- * with no validation. See the FOLLOW-UP comment at that call site for the
- * full list of things this cache never checks (size sanity, glProgramBinary
- * success, any tie between the cached blob and the shader source that
- * produced it). Clearing ux0:data/.../shader_cache/ only masks this until
- * the cache is repopulated - the underlying mechanism is unsafe, so it's
- * off entirely for now rather than papering over one bad file. Toggle back
- * to 1 only once the cache has real validation. */
-#define SSB64_VITA_PROGRAM_BINARY_CACHE 0
+/* Fast3D owns the useful cache key (combiner IDs plus the exact generated
+ * vertex/fragment source), so cache complete linked programs here instead
+ * of enabling vitaGL's lower-level per-stage cache. The old implementation
+ * stored raw size_t + payload files and passed truncated/empty data straight
+ * to glProgramBinary(), which caused a real-hardware NULL data abort. Keep a
+ * fixed-width, versioned header and verify both source and payload before the
+ * vitaGL parser is allowed to see the binary. */
+#define SSB64_VITA_CACHE_MAGIC UINT32_C(0x56334446) /* "F3DV" */
+#define SSB64_VITA_CACHE_VERSION UINT32_C(1)
+#define SSB64_VITA_CACHE_MAX_BINARY (16U * 1024U * 1024U)
+
+struct Ssb64VitaProgramCacheHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t shaderId0;
+    uint64_t shaderId1;
+    uint64_t vertexSourceHash;
+    uint64_t fragmentSourceHash;
+    uint64_t payloadHash;
+    uint32_t headerSize;
+    uint32_t binarySize;
+    uint32_t binaryFormat;
+    uint32_t numFloats;
+};
+static_assert(sizeof(Ssb64VitaProgramCacheHeader) == 64, "Vita shader-cache header ABI changed");
+
+static uint64_t Ssb64VitaHashBytes(const void* data, size_t size) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
 #endif
 
 namespace Fast {
@@ -647,16 +672,6 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     GLint success;
 
 #ifdef __vita__
-    /* Manual on-disk program-binary cache: OFF (SSB64_VITA_PROGRAM_BINARY_CACHE,
-     * defined near SHADER_MAGIC above). A real-hardware coredump showed a
-     * data abort inside vitaGL's glProgramBinary(), fault address 0x0,
-     * called from this cache's read path - an unvalidated cached blob fed
-     * straight into glProgramBinary(). See that macro's comment for the
-     * full list of what this cache never checks (size sanity,
-     * glProgramBinary() success, any tie between the cached blob and the
-     * shader source that produced it) and why clearing the cache directory
-     * is only a temporary workaround, not a fix. Left in place, behind the
-     * macro, for whoever revisits this with real validation added. */
     GLuint shader_program = 0;
 
 #if SSB64_VITA_PROGRAM_BINARY_CACHE
@@ -664,24 +679,52 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     unsigned int prog_format = 0;
     void* prog_bin = nullptr;
     char fname[256];
-    // Was hardcoded to Rinnegatamante's own "ux0:data/ghostship" from the
-    // Ghostship fork this file was merged from - see GetAppBundlePath()'s
-    // fix in Context.cpp for the full story.
     snprintf(fname, sizeof(fname), "%s/shader_cache/%016llX_%016llX_%d.bin",
              Ship::Context::GetAppDirectoryPath().c_str(), shader_id1, shader_id0, SHADER_MAGIC);
+    const uint64_t vertex_source_hash = Ssb64VitaHashBytes(vs_buf.data(), vs_buf.size());
+    const uint64_t fragment_source_hash = Ssb64VitaHashBytes(fs_buf.data(), fs_buf.size());
     FILE* f = fopen(fname, "rb");
     if (f) {
-        shader_program = glCreateProgram();
-        fseek(f, 0, SEEK_END);
-        int file_size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        prog_bin = malloc(file_size - sizeof(size_t));
-        fread(&num_floats, 1, sizeof(size_t), f);
-        fread(prog_bin, 1, file_size - sizeof(size_t), f);
+        Ssb64VitaProgramCacheHeader header = {};
+        bool valid = fread(&header, 1, sizeof(header), f) == sizeof(header) &&
+                     header.magic == SSB64_VITA_CACHE_MAGIC &&
+                     header.version == SSB64_VITA_CACHE_VERSION &&
+                     header.headerSize == sizeof(header) &&
+                     header.shaderId0 == shader_id0 && header.shaderId1 == shader_id1 &&
+                     header.vertexSourceHash == vertex_source_hash &&
+                     header.fragmentSourceHash == fragment_source_hash &&
+                     header.numFloats == num_floats &&
+                     header.binarySize > 0 &&
+                     header.binarySize <= SSB64_VITA_CACHE_MAX_BINARY;
+        if (valid) {
+            prog_bin = malloc(header.binarySize);
+            valid = prog_bin != nullptr &&
+                    fread(prog_bin, 1, header.binarySize, f) == header.binarySize &&
+                    fgetc(f) == EOF &&
+                    Ssb64VitaHashBytes(prog_bin, header.binarySize) == header.payloadHash;
+        }
         fclose(f);
-        glProgramBinary(shader_program, 0, prog_bin, file_size - sizeof(size_t));
+
+        if (valid) {
+            shader_program = glCreateProgram();
+            if (shader_program != 0) {
+                glProgramBinary(shader_program, header.binaryFormat, prog_bin, header.binarySize);
+                GLint cache_link_status = GL_FALSE;
+                glGetProgramiv(shader_program, GL_LINK_STATUS, &cache_link_status);
+                if (cache_link_status) {
+                    free(prog_bin);
+                    goto program_ready;
+                }
+                glDeleteProgram(shader_program);
+                shader_program = 0;
+            }
+        }
         free(prog_bin);
-        goto program_ready;
+        prog_bin = nullptr;
+        /* Invalid, incomplete and ABI-stale entries are regenerated below.
+         * Removing only this exact key also prevents retrying a rejected
+         * blob on every launch. */
+        remove(fname);
     }
 #endif
 #endif
@@ -715,6 +758,11 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
 
 #ifdef __vita__
         shader_program = glCreateProgram();
+        if (shader_program == 0) {
+            glDeleteShader(vertex_shader);
+            glDeleteShader(fragment_shader);
+            return nullptr;
+        }
 #else
         GLuint shader_program = glCreateProgram();
 #endif
@@ -774,15 +822,45 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         }
 
 #if SSB64_VITA_PROGRAM_BINARY_CACHE
-        f = fopen(fname, "wb");
-        if (f) {
-            glGetProgramiv(shader_program, GL_PROGRAM_BINARY_LENGTH, &prog_size);
-            prog_bin = malloc(prog_size);
+        glGetProgramiv(shader_program, GL_PROGRAM_BINARY_LENGTH, &prog_size);
+        if (prog_size > 0 && (unsigned int)prog_size <= SSB64_VITA_CACHE_MAX_BINARY) {
+            prog_bin = malloc((size_t)prog_size);
+        }
+        if (prog_bin) {
             glGetProgramBinary(shader_program, prog_size, &prog_len, &prog_format, prog_bin);
-            fwrite(&num_floats, 1, sizeof(size_t), f);
-            fwrite(prog_bin, 1, prog_len, f);
-            fclose(f);
+            if (prog_len > 0 && prog_len <= prog_size && num_floats <= UINT32_MAX) {
+                Ssb64VitaProgramCacheHeader header = {};
+                header.magic = SSB64_VITA_CACHE_MAGIC;
+                header.version = SSB64_VITA_CACHE_VERSION;
+                header.shaderId0 = shader_id0;
+                header.shaderId1 = shader_id1;
+                header.vertexSourceHash = vertex_source_hash;
+                header.fragmentSourceHash = fragment_source_hash;
+                header.payloadHash = Ssb64VitaHashBytes(prog_bin, (size_t)prog_len);
+                header.headerSize = sizeof(header);
+                header.binarySize = (uint32_t)prog_len;
+                header.binaryFormat = prog_format;
+                header.numFloats = (uint32_t)num_floats;
+
+                char temp_name[sizeof(fname) + 5];
+                snprintf(temp_name, sizeof(temp_name), "%s.tmp", fname);
+                f = fopen(temp_name, "wb");
+                bool written = f &&
+                               fwrite(&header, 1, sizeof(header), f) == sizeof(header) &&
+                               fwrite(prog_bin, 1, (size_t)prog_len, f) == (size_t)prog_len;
+                if (f && fclose(f) != 0) {
+                    written = false;
+                }
+                if (written) {
+                    if (rename(temp_name, fname) != 0) {
+                        remove(temp_name);
+                    }
+                } else {
+                    remove(temp_name);
+                }
+            }
             free(prog_bin);
+            prog_bin = nullptr;
         }
 #endif
     }
@@ -1003,11 +1081,17 @@ static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, 
 #ifdef __vita__
 static uint32_t sVitaVboFrameBytes = 0;
 static uint32_t sVitaVboFrameDraws = 0;
+static uint32_t sVitaVboFrameTris = 0;
+static uint32_t sVitaDrawApiFrameUs = 0;
+static uint32_t sVitaGlDrawFrameUs = 0;
 static uint32_t sVitaVboPeakBytes = 0;
 static uint32_t sVitaVboDroppedDraws = 0;
 #endif
 
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+#ifdef __vita__
+    const uint32_t vitaDrawApiStartUs = sceKernelGetProcessTimeLow();
+#endif
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
@@ -1079,13 +1163,22 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     vglBufferData(GL_ARRAY_BUFFER, vita_vbo);
     sVitaVboFrameBytes += (uint32_t)vbo_bytes;
     sVitaVboFrameDraws++;
+    sVitaVboFrameTris += (uint32_t)buf_vbo_num_tris;
     if (sVitaVboFrameBytes > sVitaVboPeakBytes) {
         sVitaVboPeakBytes = sVitaVboFrameBytes;
     }
 #else
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
 #endif
+#ifdef __vita__
+    const uint32_t vitaGlDrawStartUs = sceKernelGetProcessTimeLow();
+#endif
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+#ifdef __vita__
+    const uint32_t vitaDrawEndUs = sceKernelGetProcessTimeLow();
+    sVitaGlDrawFrameUs += vitaDrawEndUs - vitaGlDrawStartUs;
+    sVitaDrawApiFrameUs += vitaDrawEndUs - vitaDrawApiStartUs;
+#endif
     if (gPortGLDumpDraws) {
         GLDumpDrawVbo(buf_vbo, buf_vbo_len, buf_vbo_num_tris,
                       buf_vbo_num_tris ? buf_vbo_len / (3 * buf_vbo_num_tris) : 0);
@@ -1200,14 +1293,56 @@ void GfxRenderingAPIOGL::EndFrame() {
 #ifndef __vita__
     glFlush();
 #else
+    static uint32_t sVitaRenderFrames = 0;
+    static uint64_t sVitaRenderDraws = 0;
+    static uint64_t sVitaRenderTris = 0;
+    static uint64_t sVitaRenderBytes = 0;
+    static uint64_t sVitaRenderApiUs = 0;
+    static uint64_t sVitaRenderGlDrawUs = 0;
+    static uint32_t sVitaRenderApiFrameMaxUs = 0;
+
     if (mFrameCount <= 3) {
         port_log("SSB64: Vita VBO frame=%u bytes=%u draws=%u peak=%u dropped_total=%u\n",
                  (unsigned int)mFrameCount, (unsigned int)sVitaVboFrameBytes,
                  (unsigned int)sVitaVboFrameDraws, (unsigned int)sVitaVboPeakBytes,
                  (unsigned int)sVitaVboDroppedDraws);
     }
+    sVitaRenderFrames++;
+    sVitaRenderDraws += sVitaVboFrameDraws;
+    sVitaRenderTris += sVitaVboFrameTris;
+    sVitaRenderBytes += sVitaVboFrameBytes;
+    sVitaRenderApiUs += sVitaDrawApiFrameUs;
+    sVitaRenderGlDrawUs += sVitaGlDrawFrameUs;
+    if (sVitaDrawApiFrameUs > sVitaRenderApiFrameMaxUs) {
+        sVitaRenderApiFrameMaxUs = sVitaDrawApiFrameUs;
+    }
+    if (sVitaRenderFrames >= 300) {
+        port_log("SSB64: VITA_RENDER frames=%u draws=%llu draw_per_frame_x100=%u "
+                 "tris=%llu tri_per_frame=%u vbo_kib=%u "
+                 "draw_api_us_avg=%u draw_api_us_max=%u gl_draw_us_avg=%u dropped_total=%u\n",
+                 sVitaRenderFrames,
+                 (unsigned long long)sVitaRenderDraws,
+                 (uint32_t)((sVitaRenderDraws * 100U) / sVitaRenderFrames),
+                 (unsigned long long)sVitaRenderTris,
+                 (uint32_t)(sVitaRenderTris / sVitaRenderFrames),
+                 (uint32_t)(sVitaRenderBytes / 1024U),
+                 (uint32_t)(sVitaRenderApiUs / sVitaRenderFrames),
+                 sVitaRenderApiFrameMaxUs,
+                 (uint32_t)(sVitaRenderGlDrawUs / sVitaRenderFrames),
+                 sVitaVboDroppedDraws);
+        sVitaRenderFrames = 0;
+        sVitaRenderDraws = 0;
+        sVitaRenderTris = 0;
+        sVitaRenderBytes = 0;
+        sVitaRenderApiUs = 0;
+        sVitaRenderGlDrawUs = 0;
+        sVitaRenderApiFrameMaxUs = 0;
+    }
     sVitaVboFrameBytes = 0;
     sVitaVboFrameDraws = 0;
+    sVitaVboFrameTris = 0;
+    sVitaDrawApiFrameUs = 0;
+    sVitaGlDrawFrameUs = 0;
 #endif
 }
 
