@@ -49,6 +49,19 @@ extern "C" {
     }
 };
 #define SHADER_MAGIC (1)
+
+/* Disabled (2026-08-20): a real-hardware coredump showed a data abort
+ * inside vitaGL's glProgramBinary(), called from this manual on-disk
+ * program-binary cache's read path (CreateAndLoadNewShader() below), fault
+ * address 0x0 - a NULL/garbage binary blob fed straight into glProgramBinary()
+ * with no validation. See the FOLLOW-UP comment at that call site for the
+ * full list of things this cache never checks (size sanity, glProgramBinary
+ * success, any tie between the cached blob and the shader source that
+ * produced it). Clearing ux0:data/.../shader_cache/ only masks this until
+ * the cache is repopulated - the underlying mechanism is unsafe, so it's
+ * off entirely for now rather than papering over one bad file. Toggle back
+ * to 1 only once the cache has real validation. */
+#define SSB64_VITA_PROGRAM_BINARY_CACHE 0
 #endif
 
 namespace Fast {
@@ -622,23 +635,19 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     GLint success;
 
 #ifdef __vita__
-    /* FOLLOW-UP (2026-08-20, not addressed in this pass): this whole cache
-     * - read below and write further down, after glLinkProgram() - uses
-     * plain stdio (fopen/fseek/fread/fwrite) synchronously, called from
-     * whatever context CreateAndLoadNewShader() runs in (the rendering
-     * coroutine during normal gameplay). Also: the read path trusts the
-     * cached file's size/content outright (file_size - sizeof(size_t) is
-     * used for the malloc()/fread() length with no sanity check against a
-     * minimum size, no validation that glProgramBinary() actually accepted
-     * it, no version/hash tie to the shader source that produced it), and
-     * the write path (below) had no link-success check before this pass -
-     * now gated on the GL_LINK_STATUS check added below, but a corrupted or
-     * truncated cache file written some other way - e.g. a crash mid-fwrite
-     * - would still be trusted blindly on the next read. Candidate for both
-     * slowness (synchronous file I/O on the render path) and instability
-     * (unvalidated cache blob feeding glProgramBinary()), but changing the
-     * cache mechanism itself is out of scope for this pass. */
+    /* Manual on-disk program-binary cache: OFF (SSB64_VITA_PROGRAM_BINARY_CACHE,
+     * defined near SHADER_MAGIC above). A real-hardware coredump showed a
+     * data abort inside vitaGL's glProgramBinary(), fault address 0x0,
+     * called from this cache's read path - an unvalidated cached blob fed
+     * straight into glProgramBinary(). See that macro's comment for the
+     * full list of what this cache never checks (size sanity,
+     * glProgramBinary() success, any tie between the cached blob and the
+     * shader source that produced it) and why clearing the cache directory
+     * is only a temporary workaround, not a fix. Left in place, behind the
+     * macro, for whoever revisits this with real validation added. */
     GLuint shader_program = 0;
+
+#if SSB64_VITA_PROGRAM_BINARY_CACHE
     int prog_size = 0, prog_len = 0;
     unsigned int prog_format = 0;
     void* prog_bin = nullptr;
@@ -662,6 +671,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         free(prog_bin);
         goto program_ready;
     }
+#endif
 #endif
 
     {
@@ -725,6 +735,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
             return nullptr;
         }
 
+#if SSB64_VITA_PROGRAM_BINARY_CACHE
         f = fopen(fname, "wb");
         if (f) {
             glGetProgramiv(shader_program, GL_PROGRAM_BINARY_LENGTH, &prog_size);
@@ -735,6 +746,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
             fclose(f);
             free(prog_bin);
         }
+#endif
     }
 
 program_ready:
