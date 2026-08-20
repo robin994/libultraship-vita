@@ -1200,7 +1200,7 @@ void GfxRenderingAPIOGL::EndFrame() {
 #ifndef __vita__
     glFlush();
 #else
-    if (mFrameCount <= 5 || (mFrameCount % 120) == 0) {
+    if (mFrameCount <= 3) {
         port_log("SSB64: Vita VBO frame=%u bytes=%u draws=%u peak=%u dropped_total=%u\n",
                  (unsigned int)mFrameCount, (unsigned int)sVitaVboFrameBytes,
                  (unsigned int)sVitaVboFrameDraws, (unsigned int)sVitaVboPeakBytes,

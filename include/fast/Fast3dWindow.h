@@ -58,6 +58,9 @@ class Fast3dWindow : public Ship::Window {
     void SetTextureFilter(FilteringMode filteringMode);
     void SetRendererUCode(UcodeHandlers ucode);
     void EnableSRGBMode();
+#ifdef __vita__
+    bool RunEarlyShaderSelfTest(uint64_t shaderId0, uint64_t shaderId1);
+#endif
     bool DrawAndRunGraphicsCommands(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>& mtxReplacements);
     bool PresentCurrentFramebuffer();
 

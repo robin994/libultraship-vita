@@ -119,6 +119,28 @@ void Fast3dWindow::SetMaximumFrameLatency(int32_t latency) {
     mInterpreter->SetMaxFrameLatency(latency);
 }
 
+#ifdef __vita__
+bool Fast3dWindow::RunEarlyShaderSelfTest(uint64_t shaderId0, uint64_t shaderId1) {
+    if (mRenderingApi == nullptr) {
+        return false;
+    }
+
+    ShaderProgram* program = mRenderingApi->LookupShader(shaderId0, shaderId1);
+    if (program == nullptr) {
+        program = mRenderingApi->CreateAndLoadNewShader(shaderId0, shaderId1);
+    }
+
+    /* Keep a successful program in the renderer's normal in-memory cache so
+     * the later real draw can reuse it. Merely drop its vertex attributes
+     * here; the Interpreter will bind it normally when the combine mode is
+     * first encountered. */
+    if (program != nullptr) {
+        mRenderingApi->UnloadShader(program);
+    }
+    return program != nullptr;
+}
+#endif
+
 void Fast3dWindow::GetPixelDepthPrepare(float x, float y) {
     mInterpreter->GetPixelDepthPrepare(x, y);
 }

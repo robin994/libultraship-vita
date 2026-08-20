@@ -53,6 +53,8 @@ LONG_PTR SDL_WndProc;
 
 #ifdef __vita__
 #include <vitasdk.h>
+extern "C" void vglSwapBuffers(GLboolean has_commondialog);
+extern "C" void port_log(const char* fmt, ...);
 #endif
 
 namespace Fast {
@@ -264,7 +266,7 @@ void GfxWindowBackendSDL2::SetFullscreenImpl(bool on, bool call_callback) {
         auto conf = Ship::Context::GetInstance()->GetConfig();
 #ifdef __vita__
         mWindowWidth = conf->GetInt("Window.Width", 960);
-        mWindowHeight = conf->GetInt("Window.Height", 545);
+        mWindowHeight = conf->GetInt("Window.Height", 544);
         int32_t posX = conf->GetInt("Window.PositionX", 0);
         int32_t posY = conf->GetInt("Window.PositionY", 0);
 #else
@@ -374,7 +376,7 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     posX = 0;
     posY = 0;
     width = 960;
-    height = 545;
+    height = 544;
     SDL_setenv("VITA_USE_GLSL_TRANSLATOR", "1", 1);
     // Was hardcoded to Rinnegatamante's own "ux0:data/ghostship" from the
     // Ghostship fork this file was merged from - see GetAppBundlePath()'s
@@ -595,12 +597,25 @@ void GfxWindowBackendSDL2::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn),
 }
 
 void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
-#ifdef __APPLE__
+#ifdef __vita__
+    /* VitaSDK SDL2 currently returns 0x0 from both SDL_GetWindowSize() and
+     * SDL_GL_GetDrawableSize() for the OpenGL window. That propagated into
+     * Interpreter::StartFrame, left Fast3D rendering into a 32x32 fallback
+     * viewport, and made a healthy frame appear completely black. The Vita
+     * display surface created by vitaGL is fixed-size, so expose its physical
+     * dimensions directly instead of querying SDL's desktop-window API. */
+    *width = 960;
+    *height = 544;
+    *posX = 0;
+    *posY = 0;
+#elif defined(__APPLE__)
     SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
 #else
     SDL_GL_GetDrawableSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
 #endif
+#ifndef __vita__
     SDL_GetWindowPosition(mWnd, static_cast<int*>(posX), static_cast<int*>(posY));
+#endif
 }
 
 int GfxWindowBackendSDL2::TranslateScancode(int scancode) const {
@@ -676,7 +691,12 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
         case SDL_WINDOWEVENT:
             switch (event.window.event) {
                 case SDL_WINDOWEVENT_SIZE_CHANGED:
-#ifdef __APPLE__
+#ifdef __vita__
+                    // vitaGL owns a fixed 960x544 display surface. SDL's Vita
+                    // drawable-size query reports 0x0 and must not overwrite it.
+                    mWindowWidth = 960;
+                    mWindowHeight = 544;
+#elif defined(__APPLE__)
                     SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
 #else
                     SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
@@ -829,12 +849,30 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
 
     if (mVsyncEnabled != nextVsyncEnabled) {
         mVsyncEnabled = nextVsyncEnabled;
+#ifndef __vita__
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+#endif
     }
 
     SyncFramerateWithTime();
+#ifdef __vita__
+    /* This build initializes and renders through vitaGL directly, while the
+     * VitaSDK-bundled SDL2 is the stock sceGxm SDL_Renderer backend, not the
+     * Northfear vitaGL SDL fork. Its SDL_GL_SwapWindow therefore cannot
+     * present vitaGL's global display surface. End the vitaGL frame directly.
+     * GL_FALSE means no Sony common-dialog overlay is active; it is not a
+     * vsync flag. */
+    static uint32_t sVitaSwapCount = 0;
+    sVitaSwapCount++;
+    if (sVitaSwapCount <= 3) {
+        port_log("SSB64: Vita swap frame=%u backend=vglSwapBuffers common_dialog=0\n",
+                 (unsigned int)sVitaSwapCount);
+    }
+    vglSwapBuffers(GL_FALSE);
+#else
     SDL_GL_SwapWindow(mWnd);
+#endif
 }
 
 void GfxWindowBackendSDL2::SwapBuffersEnd() {

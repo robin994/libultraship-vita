@@ -6970,7 +6970,16 @@ bool Interpreter::IsFrameReady() {
 }
 
 bool Interpreter::ViewportMatchesRendererResolution() {
-#ifdef __APPLE__
+#ifdef __vita__
+    /* The Vita port presents through vitaGL's native 960x544 framebuffer.
+     * Do not route the frame through mGameFb -> ImGui::Image: real hardware
+     * accepts all Fast3D draws but that off-screen texture composition remains
+     * black. Direct rendering also removes one full-screen copy and one FBO's
+     * memory cost. Vita boot code pins MSAA=1 and disables post-processing, so
+     * StartFrame can select FB 0 even if ImGui reports a transient one-pixel
+     * viewport mismatch while its dockspace settles. */
+    return true;
+#elif defined(__APPLE__)
     // Always treat the viewport as not matching the render resolution on mac
     // to avoid issues with retina scaling.
     return false;
@@ -7061,6 +7070,23 @@ void Interpreter::StartFrame() {
     } else {
         mRendersToFb = false;
     }
+
+#ifdef __vita__
+    static uint32_t sVitaPresentFrame = 0;
+    sVitaPresentFrame++;
+    if (sVitaPresentFrame <= 3) {
+        port_log("SSB64: Vita present frame=%u path=%s window=%ux%u render=%ux%u "
+                 "viewport=(%d,%d %dx%d) msaa=%u postprocess=%u force_offscreen=%u\n",
+                 (unsigned int)sVitaPresentFrame, mRendersToFb ? "offscreen" : "direct-fb0",
+                 (unsigned int)mGfxCurrentWindowDimensions.width,
+                 (unsigned int)mGfxCurrentWindowDimensions.height,
+                 (unsigned int)mCurDimensions.width, (unsigned int)mCurDimensions.height,
+                 (int)mGameWindowViewport.x, (int)mGameWindowViewport.y,
+                 (int)mGameWindowViewport.width, (int)mGameWindowViewport.height,
+                 (unsigned int)mMsaaLevel, mPostProcessChain.IsActive() ? 1U : 0U,
+                 mForceRenderToFb ? 1U : 0U);
+    }
+#endif
 
     // Resize the post-process output FBO to track the window. The chain
     // bails out internally when dimensions are unchanged or zero, and is
