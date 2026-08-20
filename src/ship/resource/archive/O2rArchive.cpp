@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <malloc.h>
+#include <new>
 #include <zlib.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -21,20 +22,6 @@ namespace Ship {
 
 #ifdef __vita__
 #include <cstdio>
-
-/* Corruption-hunting diagnostic, OFF by default (2026-08-20): re-checksums
- * the archive's real bytes (baseline once in Open(), then again on every
- * single LoadFile() call to compare) to catch something outside libzip
- * writing into mArchiveBuffer. With ArchDiagLog() already a no-op, the
- * baseline compute is a one-time ~12MB scan (cheap), but the per-LoadFile()
- * scan is not - it re-scans the same ~12MB BattleShip.o2r buffer for every
- * single resource load (hundreds of calls during character-roster load
- * alone), which is a real, measurable cost with no diagnostic output to
- * show for it while this is off. Define to 1 to re-enable if hunting this
- * specific corruption bug again. */
-#ifndef SSB64_ARCHIVE_CRC_DIAGNOSTIC
-#define SSB64_ARCHIVE_CRC_DIAGNOSTIC 0
-#endif
 
 /* TEMPORARY DIAGNOSTIC helper: port_log()'s normal async queue can lose its
  * last message if a crash happens before the dedicated writer thread gets
@@ -141,28 +128,6 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         return nullptr;
     }
 
-#if defined(__vita__) && SSB64_ARCHIVE_CRC_DIAGNOSTIC
-    /* TEMPORARY DIAGNOSTIC: corruption-hunting. Re-checksum the archive's
-     * real (unpadded) bytes on every single LoadFile() call, before doing
-     * anything else, and compare against the baseline taken once in Open().
-     * libzip only ever reads from this buffer (see Open()'s "freep = 0"
-     * comment) - it is never itself the writer - so any mismatch here means
-     * something OUTSIDE libzip/zlib wrote into this memory region between
-     * Open() and this call. This runs on every call specifically so that,
-     * if it ever fires, the *previous* successful call and *this* one
-     * bracket the window the corruption happened in - the goal is finding
-     * that window, not the specific bug yet. Off by default: scanning the
-     * whole ~12MB archive buffer on every single resource load is a real,
-     * measurable cost - see SSB64_ARCHIVE_CRC_DIAGNOSTIC above. */
-    uint32_t currentCrc = (uint32_t)crc32(0L, mArchiveBuffer.data(), (uInt)mArchiveBufferRealSize);
-    if (currentCrc != mArchiveBufferBaselineCrc) {
-        ArchDiagLog("SSB64: ARCHDIAG *** CORRUPTION DETECTED *** archive=%s requesting=%s "
-                 "baseline_crc=%08x current_crc=%08x size=%zu\n",
-                 GetPath().c_str(), filePath.c_str(), (unsigned int)mArchiveBufferBaselineCrc,
-                 (unsigned int)currentCrc, mArchiveBufferRealSize);
-    }
-#endif
-
     auto zipEntryIndex = zip_name_locate(mZipArchive, filePath.c_str(), 0);
     if (zipEntryIndex < 0) {
         SPDLOG_TRACE("Failed to find file {} in zip archive  {}.", filePath, GetPath());
@@ -205,8 +170,7 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
     fileToLoad->Buffer = std::make_shared<std::vector<char>>(zipEntryStat.size);
 
 #ifdef __vita__
-    /* Same reasoning as mArchiveBuffer's padding in Open(): zlib's
-     * inflate_fast() fast path (and libzip's own internal copy buffer) can
+    /* zlib's inflate_fast() fast path (and libzip's own internal copy buffer) can
      * write in wider bursts than the exact byte count requested, especially
      * pathological for tiny entries (e.g. this archive's 5-byte "version"
      * file, deflate-compressed to 10 bytes - decompression output smaller
@@ -373,138 +337,191 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 }
 
 #ifdef __vita__
-/* Read an entire file into `out` using raw kernel I/O.
+/* Seek-free libzip source for real Vita hardware.
  *
- * Real-hardware testing repeatedly produced a psp2dmp with the main thread
- * faulting inside sceIoLseek32, reached through libzip's stdio file source
- * (_zip_stdio_op_seek -> _fseeko_r -> __sseek -> _lseek_r -> sceIoLseek32),
- * always seeking to the exact same archive offset. The same binary runs
- * fine under Vita3K, whose HLE filesystem never exercises that path the
- * same way. Rather than keep chasing the syscall, drop the dependency:
- * pull the archive into RAM once with sceIoOpen/sceIoRead (no lseek, no
- * newlib stdio) and hand libzip a plain memory buffer. Random access then
- * costs nothing and never touches the filesystem again - which is also a
- * straight win on a console reading from a slow microSD.
+ * The stock stdio source previously crashed deterministically inside
+ * sceIoLseek32. Loading the whole archive into a vector avoided that call,
+ * but permanently consumed roughly 12 MiB of the already constrained
+ * newlib heap. By the first gameplay shader compile the heap had only a few
+ * KiB free, and SceShaccCg returned only "fatal internal error on line -1".
  *
- * Size comes from sceIoGetstat rather than a seek-to-end for the same
- * reason: it avoids lseek entirely. */
-static bool VitaReadWholeFile(const std::string& path, std::vector<uint8_t>& out) {
+ * Keep one raw descriptor open and implement libzip's logical seek as an
+ * in-memory offset update. Reads use sceIoPread(), which takes an explicit
+ * offset and never mutates or consults the descriptor's seek position. This
+ * preserves the lseek workaround without retaining the archive in RAM. */
+struct VitaPreadZipSource {
+    SceUID fd;
+    zip_uint64_t size;
+    zip_uint64_t offset;
+    zip_error_t error;
+};
+
+static zip_int64_t VitaPreadZipSourceCallback(void* statePtr, void* data, zip_uint64_t len,
+                                              zip_source_cmd_t command) {
+    VitaPreadZipSource* state = static_cast<VitaPreadZipSource*>(statePtr);
+
+    switch (command) {
+        case ZIP_SOURCE_OPEN:
+            state->offset = 0;
+            zip_error_set(&state->error, ZIP_ER_OK, 0);
+            return 0;
+
+        case ZIP_SOURCE_READ: {
+            if (data == nullptr && len != 0) {
+                zip_error_set(&state->error, ZIP_ER_INVAL, 0);
+                return -1;
+            }
+            if (state->offset >= state->size || len == 0) {
+                return 0;
+            }
+
+            const zip_uint64_t remaining = state->size - state->offset;
+            /* Keep requests comfortably inside sceIoPread's SceSize/int
+             * result range. libzip accepts short reads and will request the
+             * remainder on its next callback. */
+            const zip_uint64_t request64 = std::min<zip_uint64_t>(
+                std::min<zip_uint64_t>(len, remaining), 1024u * 1024u);
+            const int got = sceIoPread(state->fd, data, static_cast<SceSize>(request64),
+                                       static_cast<SceOff>(state->offset));
+            if (got < 0) {
+                port_log("SSB64: Vita O2R pread failed offset=%llu request=%u rc=0x%08X\n",
+                         (unsigned long long)state->offset, (unsigned int)request64, (unsigned int)got);
+                zip_error_set(&state->error, ZIP_ER_READ, got);
+                return -1;
+            }
+            if (got == 0) {
+                port_log("SSB64: Vita O2R unexpected EOF offset=%llu request=%u\n",
+                         (unsigned long long)state->offset, (unsigned int)request64);
+                zip_error_set(&state->error, ZIP_ER_EOF, 0);
+                return -1;
+            }
+            state->offset += static_cast<zip_uint64_t>(got);
+            return got;
+        }
+
+        case ZIP_SOURCE_CLOSE:
+            /* The descriptor belongs to the source for its whole lifetime.
+             * libzip can OPEN/CLOSE it repeatedly while extracting entries;
+             * only FREE releases the kernel handle. */
+            return 0;
+
+        case ZIP_SOURCE_STAT: {
+            if (data == nullptr || len < sizeof(zip_stat_t)) {
+                zip_error_set(&state->error, ZIP_ER_INVAL, 0);
+                return -1;
+            }
+            zip_stat_t* stat = static_cast<zip_stat_t*>(data);
+            zip_stat_init(stat);
+            stat->size = state->size;
+            stat->valid = ZIP_STAT_SIZE;
+            return sizeof(zip_stat_t);
+        }
+
+        case ZIP_SOURCE_ERROR:
+            return zip_error_to_data(&state->error, data, len);
+
+        case ZIP_SOURCE_FREE:
+            if (state->fd >= 0) {
+                sceIoClose(state->fd);
+                state->fd = -1;
+            }
+            zip_error_fini(&state->error);
+            delete state;
+            return 0;
+
+        case ZIP_SOURCE_SEEK: {
+            const zip_int64_t newOffset = zip_source_seek_compute_offset(
+                state->offset, state->size, data, len, &state->error);
+            if (newOffset < 0) {
+                return -1;
+            }
+            state->offset = static_cast<zip_uint64_t>(newOffset);
+            return 0;
+        }
+
+        case ZIP_SOURCE_TELL:
+            return static_cast<zip_int64_t>(state->offset);
+
+        case ZIP_SOURCE_SUPPORTS:
+            return ZIP_SOURCE_SUPPORTS_SEEKABLE;
+
+        default:
+            zip_error_set(&state->error, ZIP_ER_OPNOTSUPP, 0);
+            return -1;
+    }
+}
+
+static zip_source_t* VitaCreatePreadZipSource(const std::string& path, zip_error_t* zipError) {
     SceIoStat stat;
     sceClibMemset(&stat, 0, sizeof(stat));
     const int statRc = sceIoGetstat(path.c_str(), &stat);
     if (statRc < 0) {
         SPDLOG_ERROR("sceIoGetstat failed for \"{}\" (rc=0x{:08X})", path, (unsigned int)statRc);
-        return false;
+        zip_error_set(zipError, ZIP_ER_OPEN, statRc);
+        return nullptr;
     }
 
     const SceOff fileSize = stat.st_size;
     if (fileSize <= 0) {
         SPDLOG_ERROR("Archive \"{}\" reports size {}", path, (long long)fileSize);
-        return false;
+        zip_error_set(zipError, ZIP_ER_INVAL, 0);
+        return nullptr;
     }
 
     SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
     if (fd < 0) {
         SPDLOG_ERROR("sceIoOpen failed for \"{}\" (rc=0x{:08X})", path, (unsigned int)fd);
-        return false;
+        zip_error_set(zipError, ZIP_ER_OPEN, fd);
+        return nullptr;
     }
 
-    out.resize(static_cast<size_t>(fileSize));
-
-    /* Chunked so a single huge request can't trip the driver, and so a
-     * short read is detected rather than silently leaving a partial tail. */
-    const size_t kChunk = 1u * 1024u * 1024u;
-    size_t done = 0;
-    while (done < out.size()) {
-        const size_t want = std::min(kChunk, out.size() - done);
-        const int got = sceIoRead(fd, out.data() + done, want);
-        if (got <= 0) {
-            break;
-        }
-        done += static_cast<size_t>(got);
+    VitaPreadZipSource* state = new (std::nothrow) VitaPreadZipSource;
+    if (state == nullptr) {
+        sceIoClose(fd);
+        zip_error_set(zipError, ZIP_ER_MEMORY, 0);
+        return nullptr;
     }
-    sceIoClose(fd);
+    state->fd = fd;
+    state->size = static_cast<zip_uint64_t>(fileSize);
+    state->offset = 0;
+    zip_error_init(&state->error);
 
-    if (done != out.size()) {
-        SPDLOG_ERROR("Short read on \"{}\": got {} of {} bytes", path, (unsigned int)done, (unsigned int)out.size());
-        out.clear();
-        return false;
+    zip_source_t* source = zip_source_function_create(VitaPreadZipSourceCallback, state, zipError);
+    if (source == nullptr) {
+        sceIoClose(fd);
+        zip_error_fini(&state->error);
+        delete state;
+    } else {
+        port_log("SSB64: Vita O2R source=pread path=%s size=%llu\n", path.c_str(),
+                 (unsigned long long)fileSize);
     }
-    return true;
+    return source;
 }
 #endif
 
 bool O2rArchive::Open() {
 #ifdef __vita__
-    if (!VitaReadWholeFile(GetPath(), mArchiveBuffer)) {
-        SPDLOG_ERROR("Failed to read zip file into memory \"{}\"", GetPath());
-        return false;
-    }
-
-    /* Real-hardware testing surfaced crashes deep inside zlib (crc32_z) and
-     * in resource parsing right after this archive's decompressed data,
-     * both non-deterministic in exactly which entry/resource tripped them.
-     * A file-backed libzip source tolerates a decompressor reading a few
-     * bytes past a logical entry's end (the OS just has more file bytes
-     * behind it); a bare fixed-length memory buffer does not - the read
-     * lands past mArchiveBuffer's exact allocation and faults or returns
-     * garbage right at the edge. zip_source_buffer_create is told the real
-     * size below, so libzip's own bounds/CRC logic is unaffected - this
-     * padding only gives an accidental over-read somewhere safe to land.
-     *
-     * 4096 wasn't enough on its own - LoadFile()'s own scratch-buffer
-     * padding (this file, above) hit the identical crash signature on a
-     * different, later entry even with this padding already in place.
-     * Raised alongside that one to 64 KiB as a generous stopgap. A 16-byte-
-     * aligned memalign() replacement for this buffer was tried (targeting a
-     * confirmed NEON alignment requirement in VitaSDK's zlib) and reverted:
-     * it introduced a worse, earlier crash (a data abort from a zeroed
-     * vtable, consistent with the ~12 MB memalign() overlapping live heap
-     * memory) - see O2rArchive.h's mArchiveBuffer comment. */
-    const size_t kRealSize = mArchiveBuffer.size();
-
-#if SSB64_ARCHIVE_CRC_DIAGNOSTIC
-    /* TEMPORARY DIAGNOSTIC: corruption-hunting baseline. Checksum the real
-     * (as-read-from-disk) bytes now, before any padding/decompression
-     * touches anything, so LoadFile() can detect if this buffer's content
-     * ever changes after this point - libzip's in-memory source treats it
-     * as read-only, so any change here can only mean something outside
-     * libzip wrote into this memory region. See LoadFile() for the other
-     * half of this check. Only computed when the diagnostic is enabled -
-     * see SSB64_ARCHIVE_CRC_DIAGNOSTIC above; the corresponding per-LoadFile()
-     * check is what actually costs anything on every boot, but there's no
-     * point paying even this one-time scan when that check is compiled out. */
-    mArchiveBufferRealSize = kRealSize;
-    mArchiveBufferBaselineCrc = (uint32_t)crc32(0L, mArchiveBuffer.data(), (uInt)kRealSize);
-    ArchDiagLog("SSB64: ARCHDIAG baseline CRC for %s: size=%zu crc=%08x\n", GetPath().c_str(), kRealSize,
-             (unsigned int)mArchiveBufferBaselineCrc);
-#endif
-
-    mArchiveBuffer.resize(kRealSize + (64 * 1024), 0);
-
     zip_error_t zipErr;
     zip_error_init(&zipErr);
-    /* freep = 0: libzip must not take ownership of mArchiveBuffer's storage. */
-    zip_source_t* source = zip_source_buffer_create(mArchiveBuffer.data(), kRealSize, 0, &zipErr);
+    zip_source_t* source = VitaCreatePreadZipSource(GetPath(), &zipErr);
     if (source == nullptr) {
-        SPDLOG_ERROR("Failed to create in-memory zip source for \"{}\": {}", GetPath(),
+        SPDLOG_ERROR("Failed to create pread zip source for \"{}\": {}", GetPath(),
                      zip_error_strerror(&zipErr));
         zip_error_fini(&zipErr);
-        mArchiveBuffer.clear();
         return false;
     }
 
     mZipArchive = zip_open_from_source(source, ZIP_RDONLY, &zipErr);
     if (mZipArchive == nullptr) {
-        SPDLOG_ERROR("Failed to load zip file from memory \"{}\": {}", GetPath(), zip_error_strerror(&zipErr));
+        SPDLOG_ERROR("Failed to load zip file through pread source \"{}\": {}", GetPath(),
+                     zip_error_strerror(&zipErr));
         zip_source_free(source); /* only ours to free when the open failed */
         zip_error_fini(&zipErr);
-        mArchiveBuffer.clear();
         return false;
     }
     zip_error_fini(&zipErr);
 
-    SPDLOG_INFO("Loaded archive \"{}\" into memory ({} bytes)", GetPath(), kRealSize);
+    SPDLOG_INFO("Loaded archive \"{}\" through seek-free Vita pread source", GetPath());
 #else
     mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
     if (mZipArchive == nullptr) {
@@ -541,21 +558,14 @@ bool O2rArchive::Close() {
     }
 
     mZipArchive = nullptr;
-#ifdef __vita__
-    /* Safe to drop only now that zip_close() has released the buffer source
-     * that was pointing into it (see Open()). */
-    mArchiveBuffer.clear();
-    mArchiveBuffer.shrink_to_fit();
-#endif
     return true;
 }
 
 bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_t>& data) {
 #ifdef __vita__
-    /* Vita opens archives read-only from an in-memory buffer (see Open()),
-     * so there is no on-disk handle to write back through. Nothing in the
-     * boot path writes to an archive; fail loudly rather than silently
-     * corrupting state or reopening a second, disk-backed handle. */
+    /* The Vita source exposes only pread-based read operations. Nothing in
+     * the boot path writes to an archive; fail loudly rather than silently
+     * reopening a second writable handle with different source semantics. */
     (void)data;
     SPDLOG_ERROR("Cannot write to zip \"{}\": archives are read-only on Vita (file \"{}\")", GetPath(), filePath);
     return false;

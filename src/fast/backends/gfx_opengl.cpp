@@ -48,6 +48,7 @@ typedef enum {
 } vglMemType;
 extern "C" {
     size_t vglMemFree(vglMemType type);
+    void* vglAllocFromScratch(size_t size);
     void vglBufferData(GLenum target, const GLvoid *data);
     // vitaGL implements glAttachShader/glCompileShader/glCreateShader/
     // glDeleteShader/glLinkProgram but not glDetachShader. imgui's OpenGL3
@@ -999,6 +1000,13 @@ extern "C" int gPortGLDumpDraws;
 static void GLDumpDrawSnapshot();
 static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats);
 
+#ifdef __vita__
+static uint32_t sVitaVboFrameBytes = 0;
+static uint32_t sVitaVboFrameDraws = 0;
+static uint32_t sVitaVboPeakBytes = 0;
+static uint32_t sVitaVboDroppedDraws = 0;
+#endif
+
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
@@ -1052,7 +1060,28 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     SetPerDrawUniforms();
 
 #ifdef __vita__
-    vglBufferData(GL_ARRAY_BUFFER, buf_vbo);
+    /* vglBufferData is copy-less: GXM keeps using the supplied pointer after
+     * this call. Copy this one populated Fast3D batch into vitaGL's circular
+     * scratch pool so it remains valid for the in-flight display buffers.
+     * The old code reserved a fixed 10MB block every frame even though one
+     * batch is at most ~96KB, leaving too little memory for SceShaccCg. */
+    size_t vbo_bytes = sizeof(float) * buf_vbo_len;
+    void* vita_vbo = vglAllocFromScratch(vbo_bytes);
+    if (vita_vbo == nullptr) {
+        sVitaVboDroppedDraws++;
+        if (sVitaVboDroppedDraws <= 5 || (sVitaVboDroppedDraws % 60) == 0) {
+            port_log("SSB64: Vita VBO scratch allocation failed bytes=%u dropped=%u\n",
+                     (unsigned int)vbo_bytes, (unsigned int)sVitaVboDroppedDraws);
+        }
+        return;
+    }
+    memcpy(vita_vbo, buf_vbo, vbo_bytes);
+    vglBufferData(GL_ARRAY_BUFFER, vita_vbo);
+    sVitaVboFrameBytes += (uint32_t)vbo_bytes;
+    sVitaVboFrameDraws++;
+    if (sVitaVboFrameBytes > sVitaVboPeakBytes) {
+        sVitaVboPeakBytes = sVitaVboFrameBytes;
+    }
 #else
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
 #endif
@@ -1170,6 +1199,15 @@ void GfxRenderingAPIOGL::EndFrame() {
     }
 #ifndef __vita__
     glFlush();
+#else
+    if (mFrameCount <= 5 || (mFrameCount % 120) == 0) {
+        port_log("SSB64: Vita VBO frame=%u bytes=%u draws=%u peak=%u dropped_total=%u\n",
+                 (unsigned int)mFrameCount, (unsigned int)sVitaVboFrameBytes,
+                 (unsigned int)sVitaVboFrameDraws, (unsigned int)sVitaVboPeakBytes,
+                 (unsigned int)sVitaVboDroppedDraws);
+    }
+    sVitaVboFrameBytes = 0;
+    sVitaVboFrameDraws = 0;
 #endif
 }
 

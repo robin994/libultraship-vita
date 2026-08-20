@@ -349,6 +349,7 @@ cmake-build-**
 cmake_install.cmake
 *.a
 *.o
+*.d
 *.pc
 *.vcxproj
 *.sln

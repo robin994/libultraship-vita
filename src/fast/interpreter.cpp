@@ -446,12 +446,10 @@ typedef enum {
     VGL_MEM_ALL
 } vglMemType;
 extern "C" {
-void *vglAllocFromScratch(size_t size);
-void *vglForceAlloc(uint32_t size);
-void vglFree(void*);
 size_t vglMemFree(vglMemType type);
 void port_log(const char *fmt, ...);
 void vglSetParamBufferSize(uint32_t size);
+void vglSetCircularPoolSize(uint32_t size);
 void vglUseTripleBuffering(uint8_t usage);
 uint8_t vglInitWithCustomThreshold(int pool_size, int width, int height, int ram_threshold, int cdram_threshold, int phycont_threshold, int cdlg_threshold, SceGxmMultisampleMode msaa);
 #ifdef HAVE_TROPHIES
@@ -535,7 +533,16 @@ Interpreter::Interpreter() {
     mRdp->palettes[0] = mRdp->palette_staging[0];
     mRdp->palettes[1] = mRdp->palette_staging[1];
 #ifdef __vita__
-    vglSetParamBufferSize(6 * 1024 * 1024);
+    /* SCE_GXM's default parameter buffer is 16MB. This N64 renderer was
+     * already stable with 6MB; 4MB leaves another 2MB available to vitaGL's
+     * fallback allocators while remaining generous for Fast3D command load. */
+    vglSetParamBufferSize(4 * 1024 * 1024);
+    /* The default circular scratch pool is 32MB, split between the display
+     * buffers. Fast3D now copies only each populated batch into scratch (one
+     * batch is at most ~96KB), so reserving 16MB per in-flight frame is no
+     * longer justified. 8MB total gives each of the two buffers 4MB and
+     * returns 24MB to the pools used as SceShaccCg allocation fallbacks. */
+    vglSetCircularPoolSize(8 * 1024 * 1024);
     /* Triple buffering costs a whole extra display framebuffer's worth of
      * VRAM; per Rinnegatamante, dropping to double buffering is one of the
      * standard vitaGL memory-pressure knobs on this platform. Must be set
@@ -557,6 +564,7 @@ Interpreter::Interpreter() {
      * allocations have plenty of fallback headroom (vglMalloc walks
      * RAM -> SLOW -> BUDGET -> VRAM). */
     vglInitWithCustomThreshold(0, 960, 544, 32 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_4X);
+    port_log("SSB64: vitaGL config param=4MiB circular=8MiB display_buffers=2 ram_threshold=32MiB\n");
     /* Baseline memory reading, before the game loads any assets - pairs with
      * the same reading logged at shader-link failure in gfx_opengl.cpp, so
      * the two together show how much headroom vitaGL actually starts with
@@ -565,36 +573,20 @@ Interpreter::Interpreter() {
              (unsigned int)vglMemFree(VGL_MEM_VRAM), (unsigned int)vglMemFree(VGL_MEM_RAM),
              (unsigned int)vglMemFree(VGL_MEM_SLOW), (unsigned int)vglMemFree(VGL_MEM_BUDGET),
              (unsigned int)vglMemFree(VGL_MEM_EXTERNAL));
-    /* NOT vglAllocFromScratch: that maps to gpu_alloc_mapped_temp, which is
-     * vitaGL's *temporary* allocator - it either marks the block dirty for
-     * the garbage collector or hands out a slice of the circular data pool
-     * that is recycled every frame. mBufVbo is the vertex buffer Fast3D
-     * writes geometry into and keeps for the entire process lifetime, so
-     * holding temp memory here meant (a) the vertex data could be recycled
-     * out from under the renderer mid-frame, and (b) 10MB was permanently
-     * squatting in the circular pool, which real-hardware logs showed
-     * thrashing badly: 87 failed 10MB allocations, each recovered only by
-     * forcing 4 garbage collection cycles, which in turn starved
-     * SceShaccCg and made every runtime shader compile fail. vglForceAlloc
-     * (gpu_alloc_mapped_for_cpu) is the persistent GPU-mapped CPU-writable
-     * allocator - the correct one for a buffer with this lifetime. */
-    mBufVbo = (float *)vglForceAlloc(10 * 1024 * 1024);
-    port_log("SSB64: mBufVbo persistent alloc = %p\n", (void *)mBufVbo);
-    port_log("SSB64: vitaGL pools after 10MB scratch | free vram=%u ram=%u slow=%u budget=%u ext=%u\n",
-             (unsigned int)vglMemFree(VGL_MEM_VRAM), (unsigned int)vglMemFree(VGL_MEM_RAM),
-             (unsigned int)vglMemFree(VGL_MEM_SLOW), (unsigned int)vglMemFree(VGL_MEM_BUDGET),
-             (unsigned int)vglMemFree(VGL_MEM_EXTERNAL));
-#else
-    mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
 #endif
+    /* This is CPU staging for one Fast3D batch, not storage submitted
+     * directly to GXM. The Vita GL backend copies only the populated bytes
+     * into vitaGL's per-frame scratch pool in DrawTriangles(). Keeping the
+     * same bounded buffer used by the desktop path avoids the previous 10MB
+     * scratch reservation on every frame while preserving vitaGL's required
+     * lifetime for buffers still in flight on the GPU. */
+    mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
 }
 
 Interpreter::~Interpreter() {
     delete mRsp;
     delete mRdp;
-#ifndef __vita__
     delete[] mBufVbo;
-#endif
 }
 
 static std::weak_ptr<Interpreter> mInstance;
@@ -775,9 +767,6 @@ void Interpreter::Flush() {
         // Emit a marker into the GBI trace so draw-dump indices can be
         // correlated with positions in the traced command stream.
         gbi_trace_note_flush((int)mBufVboNumTris);
-#ifdef __vita__
-        mBufVbo += mBufVboLen;
-#endif
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -7389,9 +7378,6 @@ void Interpreter::EndFrame() {
     mWapi->SwapBuffersBegin();
     mRapi->FinishRender();
     mWapi->SwapBuffersEnd();
-#ifdef __vita__
-	mBufVbo = (float*)vglAllocFromScratch(10 * 1024 * 1024);
-#endif
 }
 
 void gfx_set_target_ucode(UcodeHandlers ucode) {
