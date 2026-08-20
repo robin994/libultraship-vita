@@ -191,23 +191,23 @@ struct TextureCacheKey {
     uint8_t masks, maskt;
     uint16_t tile_width, tile_height;
 
-#ifdef __vita__
-    bool operator==(const TextureCacheKey& rhs) const {
-        return !sceClibMemcmp(&rhs, this, sizeof(TextureCacheKey));
-    };
-    struct Hasher {
-        size_t operator()(const TextureCacheKey& key) const noexcept {
-            return (size_t)key.texture_addr;
-        }
-    };
-#else
-    bool operator==(const TextureCacheKey&) const noexcept = default;
+    bool operator==(const TextureCacheKey& rhs) const noexcept {
+        // Never compare this aggregate with memcmp.  It contains padding
+        // after palette_index and at the end on 32-bit Vita; those bytes are
+        // not initialized by aggregate construction and made logically
+        // identical keys compare unequal, turning every load into a miss.
+        return texture_addr == rhs.texture_addr && palette_addrs[0] == rhs.palette_addrs[0] &&
+               palette_addrs[1] == rhs.palette_addrs[1] && fmt == rhs.fmt && siz == rhs.siz &&
+               palette_index == rhs.palette_index && size_bytes == rhs.size_bytes && masks == rhs.masks &&
+               maskt == rhs.maskt && tile_width == rhs.tile_width && tile_height == rhs.tile_height;
+    }
 
     struct Hasher {
         size_t operator()(const TextureCacheKey& key) const noexcept {
-            // FNV-1a over every field operator== compares. Hashing only the
-            // address degrades the map to a linked list when the game's bump
-            // heaps cycle many textures through the same addresses.
+            // FNV-1a over every field operator== compares.  Hashing only the
+            // address, as the old Vita path did, degrades the map to a linked
+            // list when the game's bump heaps cycle many texture shapes
+            // through the same addresses.
             uint64_t h = 1469598103934665603ULL;
             auto mix = [&h](uint64_t v) {
                 h ^= v;
@@ -222,18 +222,18 @@ struct TextureCacheKey {
             return (size_t)h;
         }
     };
-#endif
 };
 
 struct TextureCacheValue {
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
-    // FNV-1a of the source bytes (texture_addr..+size_bytes) at import time.
-    // The cache key is raw-pointer identity; the game's bump heaps and the
-    // port's bridge buffers recycle addresses, so identity alone can alias
-    // two different textures. Verified on hit (see TextureCacheLookup);
-    // 0 when verification is disabled or the key carries no size.
+    // FNV-1a of the source texels and, for CI textures, the active TLUT bytes
+    // used by the decode. The cache key is raw-pointer identity; the game's
+    // bump heaps, bridge buffers, and palette staging recycle addresses, so
+    // identity alone can alias different decoded RGBA textures. Verified on
+    // hit (see TextureCacheLookup); 0 when verification is disabled or the
+    // key carries no size.
     uint64_t content_hash;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;

@@ -869,7 +869,26 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         port_log("SSB64: Vita swap frame=%u backend=vglSwapBuffers common_dialog=0\n",
                  (unsigned int)sVitaSwapCount);
     }
+    const uint32_t swapStartUs = sceKernelGetProcessTimeLow();
     vglSwapBuffers(GL_FALSE);
+    const uint32_t swapUs = sceKernelGetProcessTimeLow() - swapStartUs;
+    static uint32_t sVitaSwapPerfFrames = 0;
+    static uint64_t sVitaSwapPerfUsTotal = 0;
+    static uint32_t sVitaSwapPerfUsMax = 0;
+    sVitaSwapPerfFrames++;
+    sVitaSwapPerfUsTotal += swapUs;
+    if (swapUs > sVitaSwapPerfUsMax) {
+        sVitaSwapPerfUsMax = swapUs;
+    }
+    if (sVitaSwapPerfFrames >= 300) {
+        port_log("SSB64: PERF present_frames=%u swap_us_avg=%u swap_us_max=%u\n",
+                 (unsigned int)sVitaSwapPerfFrames,
+                 (unsigned int)(sVitaSwapPerfUsTotal / sVitaSwapPerfFrames),
+                 (unsigned int)sVitaSwapPerfUsMax);
+        sVitaSwapPerfFrames = 0;
+        sVitaSwapPerfUsTotal = 0;
+        sVitaSwapPerfUsMax = 0;
+    }
 #else
     SDL_GL_SwapWindow(mWnd);
 #endif

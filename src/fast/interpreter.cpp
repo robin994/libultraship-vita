@@ -1073,6 +1073,27 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
     return &mPrevCombiner->second;
 }
 
+#ifdef __vita__
+// Interval counters intentionally use fixed-width 32-bit values so the Vita
+// logger does not depend on newlib's problematic size_t printf formats.  One
+// compact line every 300 presented frames is enough to identify cache
+// thrashing without putting per-texture logging in the render hot path.
+struct VitaTextureCacheStats {
+    uint32_t frames;
+    uint32_t lookups;
+    uint32_t hits;
+    uint32_t misses;
+    uint32_t stale;
+    uint32_t evictions;
+    uint32_t new_texture_ids;
+    uint32_t reused_texture_ids;
+    uint32_t hash_bytes;
+    uint32_t palette_hash_bytes;
+};
+
+static VitaTextureCacheStats sVitaTextureCacheStats = {};
+#endif
+
 void Interpreter::TextureCacheClear() {
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
@@ -1086,11 +1107,10 @@ void Interpreter::TextureCacheClear() {
     std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
 }
 
-// FNV-1a over the texture source bytes, 8-byte strides + tail. Reads exactly
-// the range the ImportTexture* miss path would read, so it is precisely as
-// safe as a cache miss.
-static uint64_t PortTextureContentHash(const uint8_t* p, uint32_t n) {
-    uint64_t h = 1469598103934665603ULL;
+// Append bytes to an FNV-1a hash, in 8-byte strides plus a tail. The texture
+// range is exactly what the ImportTexture* miss path would read. CI palette
+// bytes come from the staging TLUT that those decoders actually consume.
+static uint64_t PortTextureContentHashAppend(uint64_t h, const uint8_t* p, uint32_t n) {
     uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
         uint64_t w;
@@ -1122,10 +1142,43 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
 
+#ifdef __vita__
+    sVitaTextureCacheStats.lookups++;
+#endif
     const bool verify = PortTextureCacheVerifyEnabled() && key.texture_addr != nullptr && key.size_bytes != 0;
     uint64_t content_hash = 0;
     if (verify) {
-        content_hash = PortTextureContentHash(key.texture_addr, key.size_bytes);
+        content_hash = 1469598103934665603ULL;
+        content_hash = PortTextureContentHashAppend(content_hash, key.texture_addr, key.size_bytes);
+        uint32_t palette_hash_bytes = 0;
+
+        // CI decode bakes the current TLUT into the uploaded RGBA texture.
+        // palette_dram_addr in the key distinguishes different source
+        // pointers, but SSB64 frequently rewrites a palette in place. Hash
+        // the staging bytes used by the decoder so those updates become
+        // stale-content misses instead of false hits with old alpha/colors.
+        if (key.fmt == G_IM_FMT_CI && key.siz == G_IM_SIZ_4b) {
+            const uint32_t palette_half = key.palette_index / 8;
+            const uint32_t palette_offset = (key.palette_index % 8) * 16 * 2;
+            const uint8_t* palette = mRdp->palettes[palette_half];
+            if (palette != nullptr) {
+                palette_hash_bytes = 16 * 2;
+                content_hash = PortTextureContentHashAppend(content_hash, palette + palette_offset,
+                                                            palette_hash_bytes);
+            }
+        } else if (key.fmt == G_IM_FMT_CI && key.siz == G_IM_SIZ_8b) {
+            for (uint32_t palette_half = 0; palette_half < 2; palette_half++) {
+                const uint8_t* palette = mRdp->palettes[palette_half];
+                if (palette != nullptr) {
+                    content_hash = PortTextureContentHashAppend(content_hash, palette, 256);
+                    palette_hash_bytes += 256;
+                }
+            }
+        }
+#ifdef __vita__
+        sVitaTextureCacheStats.hash_bytes += key.size_bytes + palette_hash_bytes;
+        sVitaTextureCacheStats.palette_hash_bytes += palette_hash_bytes;
+#endif
     }
 
     if (it != mTextureCache.map.end()) {
@@ -1134,6 +1187,9 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
             // Evict and fall through to the miss path so the caller
             // re-imports the current contents.
             static int sStaleLogCount = 0;
+#ifdef __vita__
+            sVitaTextureCacheStats.stale++;
+#endif
             if (sStaleLogCount < 64) {
                 SPDLOG_WARN("TextureCache stale-content hit healed: addr={} fmt={} siz={} {}x{} bytes={}",
                             (const void*)key.texture_addr, key.fmt, key.siz, key.tile_width, key.tile_height,
@@ -1149,6 +1205,9 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
             mTextureCache.map.erase(it);
             it = mTextureCache.map.end();
         } else {
+#ifdef __vita__
+            sVitaTextureCacheStats.hits++;
+#endif
             mRapi->SelectTexture(i, it->second.texture_id);
             *n = &*it;
             mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
@@ -1157,6 +1216,9 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         }
     }
 
+#ifdef __vita__
+    sVitaTextureCacheStats.misses++;
+#endif
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
         // Remove the texture that was least recently used
         it = mTextureCache.lru.front().it;
@@ -1167,14 +1229,23 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         }
         mTextureCache.map.erase(it);
         mTextureCache.lru.pop_front();
+#ifdef __vita__
+        sVitaTextureCacheStats.evictions++;
+#endif
     }
 
     uint32_t texture_id;
     if (!mTextureCache.free_texture_ids.empty()) {
         texture_id = mTextureCache.free_texture_ids.back();
         mTextureCache.free_texture_ids.pop_back();
+#ifdef __vita__
+        sVitaTextureCacheStats.reused_texture_ids++;
+#endif
     } else {
         texture_id = mRapi->NewTexture();
+#ifdef __vita__
+        sVitaTextureCacheStats.new_texture_ids++;
+#endif
     }
 
     it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
@@ -6962,6 +7033,10 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
 
     // Pre-allocate texture cache buckets to prevent rehash-induced iterator invalidation.
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
+#ifdef __vita__
+    port_log("SSB64: TEXCACHE config key=fieldwise hash=all-fields verify=texture+palette max_entries=%u report_frames=300\n",
+             (uint32_t)TEXTURE_CACHE_MAX_SIZE);
+#endif
 }
 
 void Interpreter::Destroy() {
@@ -7423,6 +7498,19 @@ void Interpreter::EndFrame() {
     mWapi->SwapBuffersBegin();
     mRapi->FinishRender();
     mWapi->SwapBuffersEnd();
+#ifdef __vita__
+    sVitaTextureCacheStats.frames++;
+    if (sVitaTextureCacheStats.frames >= 300) {
+        port_log("SSB64: TEXCACHE frames=%u entries=%u lookups=%u hits=%u misses=%u stale=%u evictions=%u new_ids=%u reused_ids=%u hash_kib=%u palette_kib=%u\n",
+                 sVitaTextureCacheStats.frames, (uint32_t)mTextureCache.map.size(),
+                 sVitaTextureCacheStats.lookups, sVitaTextureCacheStats.hits, sVitaTextureCacheStats.misses,
+                 sVitaTextureCacheStats.stale, sVitaTextureCacheStats.evictions,
+                 sVitaTextureCacheStats.new_texture_ids, sVitaTextureCacheStats.reused_texture_ids,
+                 sVitaTextureCacheStats.hash_bytes / 1024U,
+                 sVitaTextureCacheStats.palette_hash_bytes / 1024U);
+        sVitaTextureCacheStats = {};
+    }
+#endif
 }
 
 void gfx_set_target_ucode(UcodeHandlers ucode) {
