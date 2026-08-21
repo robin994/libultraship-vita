@@ -1096,6 +1096,369 @@ struct VitaTextureCacheStats {
 };
 
 static VitaTextureCacheStats sVitaTextureCacheStats = {};
+
+#ifdef __vita__
+// TRACK C (2026-08-21): black-border investigation. Established facts (PERF
+// build): final Vita presentation is window=render=viewport=960x544, so the
+// borders aren't introduced by the swap-chain viewport. This snapshots the
+// N64-logical -> physical transform pipeline itself (CalcAndSetViewport /
+// GfxDpSetScissor -> AdjustVIewportOrScissor) once, for one settled gameplay
+// frame (gated on a total-frame count past the intro), so the exact stage
+// that shrinks the content rect below 960x544 (if any) is visible directly
+// instead of inferred from code reading.
+static uint64_t sVitaTotalFrameCount = 0;
+struct VitaRectSnapshot {
+    bool captured = false;
+    float raw_x = 0, raw_y = 0, raw_w = 0, raw_h = 0;
+    float adj_x = 0, adj_y = 0, adj_w = 0, adj_h = 0;
+    /* N64-authored xmin/ymin/xmax/ymax exactly as named in the RDP command
+     * (ulx/uly/lrx/lry / 4), independent of the raw_ and adj_ fields above
+     * (which use the flipped-Y x/y/width/height convention the rest of the
+     * pipeline works in) — kept separately so the report can be read
+     * without doing the flip math by hand. Scissor-only; unused for
+     * viewport (CalcAndSetViewport has no ulx/uly/lrx/lry to source from). */
+    float n64_xmin = 0, n64_ymin = 0, n64_xmax = 0, n64_ymax = 0;
+};
+static VitaRectSnapshot sVitaViewportSnapshot;
+static VitaRectSnapshot sVitaScissorSnapshot;
+static bool sVitaTrackCReported = false;
+/* True only while the game-selected N64 scissor is the canonical 10-pixel
+ * safe-area rectangle. Texture rectangles must use the matching overscan
+ * viewport only in that state; applying it to local UI/camera scissors shifts
+ * and scales text/sprites even though their clip rectangle is intentionally
+ * local. */
+static bool sVitaDefaultSafeAreaScissorActive = false;
+#define VITA_TRACKC_SETTLE_FRAMES 900
+
+// SSB64 uses a 10-pixel N64 safe-area margin (10..310, 10..230) for its
+// default 2D clip. Match only that physical rectangle; local camera/UI
+// scissors must retain their authored bounds.
+static bool VitaIsDefaultSafeAreaRect(const XYWidthHeight& rect, int32_t canvas_x, int32_t canvas_y,
+                                      uint32_t canvas_w, uint32_t canvas_h) {
+    const int32_t expected_x = canvas_x + (int32_t)(canvas_w / 32U);
+    const int32_t expected_y = canvas_y + (int32_t)(canvas_h / 24U);
+    const uint32_t expected_w = (canvas_w * 15U) / 16U;
+    const uint32_t expected_h = (canvas_h * 11U) / 12U;
+    const int32_t tolerance = 4;
+    return abs((int32_t)rect.x - expected_x) <= tolerance &&
+           abs((int32_t)rect.y - expected_y) <= tolerance &&
+           abs((int32_t)rect.width - (int32_t)expected_w) <= tolerance &&
+           abs((int32_t)rect.height - (int32_t)expected_h) <= tolerance;
+}
+
+static void VitaApplySafeAreaCropToCanvas(XYWidthHeight* rect, int32_t canvas_x, int32_t canvas_y,
+                                          uint32_t canvas_w, uint32_t canvas_h) {
+    const uint32_t cropped_w = (canvas_w * 16U + 7U) / 15U;
+    const uint32_t cropped_h = (canvas_h * 12U + 5U) / 11U;
+    rect->x = (int16_t)(canvas_x - (int32_t)((cropped_w + 16U) / 32U));
+    rect->y = (int16_t)(canvas_y - (int32_t)((cropped_h + 12U) / 24U));
+    rect->width = cropped_w;
+    rect->height = cropped_h;
+}
+
+// TRACK A round 2 (2026-08-21): the earlier "first 20 IA textures anywhere"
+// backend trace fired entirely on unrelated sprites before scene 30 ever
+// loaded (budget exhausted). Replaced with an explicit arm/correlate
+// mechanism: decomp calls portArmMarioBackendTrace() once on entry to scene
+// 30 (mirrors lbcommon.c's existing scene-transition detection). Only then
+// do GfxDpTextureRectangle/GfxSpTri1 below recognize M/A's own screen-space
+// bounding boxes (mvOpeningMarioMakeName's known static sobj->pos.x/y) and
+// tag exactly those two TEXRECTs for full backend + real-GL-state capture.
+static bool sVitaMarioBackendArmed = false;
+static bool sVitaMarioBackendCapturedM = false;
+static bool sVitaMarioBackendCapturedA = false;
+static char sVitaMarioPendingLetter = 0; /* 'M', 'A', or 0 — set by GfxDpTextureRectangle, consumed by GfxSpTri1 */
+struct VitaRectF { float x0, y0, x1, y1; };
+static const VitaRectF kVitaMarioLetterM = { 80.0f, 100.0f, 117.0f, 137.0f };
+static const VitaRectF kVitaMarioLetterA = { 120.0f, 100.0f, 155.0f, 137.0f };
+static inline bool VitaRectsIntersect(float ax0, float ay0, float ax1, float ay1, const VitaRectF& b) {
+    return ax0 < b.x1 && ax1 > b.x0 && ay0 < b.y1 && ay1 > b.y0;
+}
+
+// TRACK A round 2: UI_DRAW_ORDER capture. Armed by the same
+// portArmMarioBackendTrace() call. Logs every TEXRECT/FILLRECT intersecting
+// the Mario-name region (x=70..250, y=90..150) in exact execution order for
+// one settled frame after arming, to distinguish "Mario itself is a white
+// block" from "Mario draws fine and a later primitive covers it."
+static const VitaRectF kVitaUiDrawOrderRegion = { 70.0f, 90.0f, 250.0f, 150.0f };
+static uint32_t sVitaUiDrawOrderSeq = 0;
+static uint64_t sVitaUiDrawOrderArmFrame = 0;
+static bool sVitaUiDrawOrderDone = false;
+#define VITA_UI_DRAW_ORDER_MAX 96
+
+// TRACK A round 3 (2026-08-21): source_gobj/source_sobj correlation. decomp
+// (lbcommon.c's lbCommonDrawSObjBitmap) pushes (gobj,sobj) into this FIFO
+// immediately before each gSPTextureRectangle it queues, scene-30-gated and
+// budget-matched to the DL build order; UI_DRAW_ORDER below pops the front
+// entry when it sees a TEXRECT, relying on DL build order == DL execution
+// order (true here — single linear command stream, no reordering). A
+// FILLRECT or any TEXRECT not sourced from an SObj bitmap draw (e.g. some
+// other UI element sharing the region) finds the queue empty and reports
+// gobj/sobj as unknown rather than misattributing the wrong entry.
+#define VITA_UI_SOURCE_QUEUE_MAX 32
+struct VitaUiSourceEntry { const void* gobj; const void* sobj; };
+static VitaUiSourceEntry sVitaUiSourceQueue[VITA_UI_SOURCE_QUEUE_MAX];
+static int sVitaUiSourceHead = 0;
+static int sVitaUiSourceTail = 0;
+
+extern "C" void portRecordUiDrawSource(const void* gobj, const void* sobj) {
+    int next = (sVitaUiSourceTail + 1) % VITA_UI_SOURCE_QUEUE_MAX;
+    if (next == sVitaUiSourceHead) {
+        return; /* queue full — drop rather than overwrite, matches "best effort" nature of this trace */
+    }
+    sVitaUiSourceQueue[sVitaUiSourceTail] = { gobj, sobj };
+    sVitaUiSourceTail = next;
+}
+
+static bool VitaPopUiDrawSource(const void** gobj, const void** sobj) {
+    if (sVitaUiSourceHead == sVitaUiSourceTail) {
+        return false;
+    }
+    *gobj = sVitaUiSourceQueue[sVitaUiSourceHead].gobj;
+    *sobj = sVitaUiSourceQueue[sVitaUiSourceHead].sobj;
+    sVitaUiSourceHead = (sVitaUiSourceHead + 1) % VITA_UI_SOURCE_QUEUE_MAX;
+    return true;
+}
+
+extern "C" void portQueryGLDepthState(int* depth_test, int* depth_func, int* depth_write, int* stencil_enabled);
+
+// TRACK A round 4 (2026-08-21): RDP_STATE_BEFORE_TEXRECT + command history.
+// MARIO_BACKEND_DRAW already proved, for M specifically, that the texture is
+// bound, the combiner produces fragment_uses_alpha=yes, and GL_BLEND is
+// enabled with SRC_ALPHA/DST_ALPHA — yet 2D content (including unrelated
+// loading/CSS sprites) is reported completely invisible even with scissor
+// forced to full-screen (ruling out clipping/overscan entirely). This is a
+// raw, unconditional (cheap: one array write, no lookup) ring buffer of the
+// last commands the interpreter executed, recorded at the top of gfx_step
+// for EVERY opcode regardless of type — so the dump immediately before the
+// first M TEXRECT can show whether some 3D-only state (a stale combine
+// mode, othermode, or tile setup from the previous 3D draw) leaked into the
+// 2D pass instead of being reset.
+#define VITA_CMD_HISTORY_SIZE 24
+struct VitaCmdHistoryEntry {
+    uint8_t opcode;
+    uint64_t w0;
+    uint64_t w1;
+};
+static VitaCmdHistoryEntry sVitaCmdHistory[VITA_CMD_HISTORY_SIZE];
+static int sVitaCmdHistoryPos = 0;
+static uint32_t sVitaCmdHistoryTotal = 0;
+
+// Self-contained opcode->name lookup (F3DEX2 values only — the only ucode
+// this build uses, per ucode_handler_index's fixed ucode_f3dex2 default) so
+// this can be defined/used before the file's main ucode_handlers table
+// exists, and so it doesn't depend on that table's internal layout.
+static const char* VitaOpcodeName(uint8_t opcode) {
+    if (opcode == (uint8_t)Fast::F3DEX2_G_DL) return "G_DL";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_ENDDL) return "G_ENDDL";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_VTX) return "G_VTX";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_TRI1) return "G_TRI1";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_TRI2) return "G_TRI2";
+    if (opcode == (uint8_t)RDP_G_SETTIMG) return "G_SETTIMG";
+    if (opcode == (uint8_t)RDP_G_SETTILE) return "G_SETTILE";
+    if (opcode == (uint8_t)RDP_G_SETTILESIZE) return "G_SETTILESIZE";
+    if (opcode == (uint8_t)RDP_G_LOADTLUT) return "G_LOADTLUT";
+    if (opcode == (uint8_t)RDP_G_LOADBLOCK) return "G_LOADBLOCK";
+    if (opcode == (uint8_t)RDP_G_LOADTILE) return "G_LOADTILE";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_TEXTURE) return "G_TEXTURE";
+    if (opcode == (uint8_t)RDP_G_SETCOMBINE) return "G_SETCOMBINE";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_SETOTHERMODE_L) return "G_SETOTHERMODE_L";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_SETOTHERMODE_H) return "G_SETOTHERMODE_H";
+    if (opcode == (uint8_t)RDP_G_TEXRECT) return "G_TEXRECT";
+    if (opcode == (uint8_t)RDP_G_FILLRECT) return "G_FILLRECT";
+    if (opcode == (uint8_t)RDP_G_SETSCISSOR) return "G_SETSCISSOR";
+    if (opcode == (uint8_t)RDP_G_SETPRIMCOLOR) return "G_SETPRIMCOLOR";
+    if (opcode == (uint8_t)RDP_G_SETENVCOLOR) return "G_SETENVCOLOR";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_MTX) return "G_MTX";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_MOVEMEM) return "G_MOVEMEM";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_GEOMETRYMODE) return "G_GEOMETRYMODE";
+    if (opcode == (uint8_t)Fast::F3DEX2_G_POPMTX) return "G_POPMTX";
+    return "G_?";
+}
+
+static bool VitaComputeUseAlpha(uint32_t other_mode_l) {
+    return ((other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) && (other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
+           ((other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) && (other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
+}
+
+extern "C" void portQueryGLBlendState(int* enabled, int* src_rgb, int* dst_rgb, int* src_alpha, int* dst_alpha,
+                                      int* equation, unsigned char color_mask[4]);
+
+extern "C" void portArmMarioBackendTrace(void) {
+    sVitaMarioBackendArmed = true;
+    sVitaUiDrawOrderArmFrame = sVitaTotalFrameCount;
+}
+
+// TRACK B (2026-08-21): persistent, never-reset count of DL pushes rejected
+// by the kDLBoundsWalkedPast guard in gfx_dl_handler_common — see the usage
+// site for why this is a live hypothesis for intermittent stage geometry.
+static uint64_t sVitaDLRejectTotal = 0;
+
+// TRACK B round 5 (2026-08-21): CASTLE_RUNTIME_DOBJ. The legacy log tag is
+// retained for grep compatibility, but objdisplay now arms it only for the
+// actual Peach's Castle / Final Destination stage kinds instead of scene 34.
+// Merges what were two
+// separate log lines (round-2 CASTLE_RUNTIME_DL static fingerprint,
+// round-3 CASTLE_GPU_STATE live capture) into one, emitted at live-execution
+// time so a good/bad hardware run pair can be diffed per-DObj on a single
+// line: same DL hash + different GPU state => state leakage/matrix/culling
+// bug; same DL hash + same GPU state => look at executed vs reachable
+// command counts instead (Fast3D control-flow bug); different DL hash =>
+// resource loading/memory issue. objdisplay.c calls
+// portArmCastleGpuStateCapture once per unique tree-drawn DObj while one of
+// those two stages is active (dedup by pointer) — that single call does the static walk
+// immediately (cheap, non-executing) AND registers the DL for live capture;
+// gfx_dl_handler_common fires the combined report the instant the
+// interpreter actually walks into that exact DL.
+#define VITA_CASTLE_TRACKED_MAX 192
+struct VitaCastleTrackedEntry {
+    const void* dl;
+    const void* gobj;
+    const void* dobj;
+    bool captured;
+    int file_id;
+    uint32_t resource_offset;
+    uint64_t dl_hash;
+    uint32_t root_command_count;
+    uint32_t recursive_command_count;
+    uint32_t nested_dl_count;
+    uint32_t vertex_load_count;
+    uint32_t tri1_count;
+    uint32_t tri2_count;
+    bool truncated;
+};
+static VitaCastleTrackedEntry sVitaCastleTracked[VITA_CASTLE_TRACKED_MAX];
+static int sVitaCastleTrackedCount = 0;
+
+static uint64_t FnvHashBytes(uint64_t h, const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+extern "C" int portRelocFindFileIdAndBase(const void* ptr, uintptr_t* out_base);
+
+// Hashes a raw command word in a way that's stable across runs/ASLR: if the
+// word looks like (and resolves as) a pointer into a reloc file, hash the
+// (file_id, offset) pair instead of the raw address; otherwise hash the raw
+// bits. Catches G_DL/G_VTX/G_MTX/G_MOVEMEM-style pointer operands generically
+// without needing to special-case every opcode that carries one.
+static uint64_t FnvHashWordResourceRelative(uint64_t h, uint64_t word) {
+    uintptr_t base = 0;
+    int file_id = (word > 0xFFFFu) ? portRelocFindFileIdAndBase((const void*)(uintptr_t)word, &base) : -1;
+    if (file_id >= 0) {
+        uint64_t rel[2] = { (uint64_t)file_id, (uint64_t)((uintptr_t)word - base) };
+        return FnvHashBytes(h, rel, sizeof(rel));
+    }
+    return FnvHashBytes(h, &word, sizeof(word));
+}
+
+struct VitaCastleDLFingerprint {
+    uint64_t hash;
+    uint32_t root_command_count;
+    uint32_t recursive_command_count;
+    uint32_t nested_dl_count;
+    uint32_t vertex_load_count;
+    uint32_t tri1_count;
+    uint32_t tri2_count;
+    uint32_t max_depth_hit;
+    bool truncated;
+};
+
+// Non-executing recursive walk of a DL tree: hashes command words
+// (resource-relative, see FnvHashWordResourceRelative) and counts opcodes
+// for a one-shot static fingerprint, entirely independent of live execution
+// (so it can't perturb rendering). Bounded by kMaxVisited/kMaxDepth so a
+// malformed or non-G_ENDDL-terminated DL can't hang the walk. Deliberately
+// does not replicate gfx_dl_handler_common's segment-0x0E runtime-widened-DL
+// special case — stage geometry is reloc-file data, not a runtime-built
+// per-MObj sub-DL, so plain SegAddr() resolution is expected to be correct.
+static void WalkCastleDLFingerprint(F3DGfx* dl, VitaCastleDLFingerprint* fp, int depth) {
+    static const uint32_t kMaxVisited = 20000;
+    static const int kMaxDepth = 12;
+    Interpreter* gfx = gInstance;
+    if (dl == nullptr || depth > kMaxDepth) {
+        fp->truncated = true;
+        return;
+    }
+    if (depth > (int)fp->max_depth_hit) {
+        fp->max_depth_hit = (uint32_t)depth;
+    }
+    for (;;) {
+        if (fp->recursive_command_count >= kMaxVisited) {
+            fp->truncated = true;
+            return;
+        }
+        fp->recursive_command_count++;
+        if (depth == 0) {
+            fp->root_command_count++;
+        }
+        uint8_t opcode = (uint8_t)(dl->words.w0 >> 24);
+        fp->hash = FnvHashWordResourceRelative(fp->hash, dl->words.w0);
+        fp->hash = FnvHashWordResourceRelative(fp->hash, dl->words.w1);
+        if (opcode == (uint8_t)Fast::F3DEX2_G_ENDDL) {
+            return;
+        }
+        if (opcode == (uint8_t)Fast::F3DEX2_G_DL) {
+            fp->nested_dl_count++;
+            bool nopush = ((dl->words.w0 >> 16) & 1) != 0;
+            F3DGfx* sub = (F3DGfx*)gfx->SegAddr(dl->words.w1);
+            if (sub != nullptr) {
+                WalkCastleDLFingerprint(sub, fp, depth + 1);
+            }
+            if (nopush) {
+                return; /* branch: control transferred, this level ends */
+            }
+            /* push: fall through, continue after this command */
+        } else if (opcode == (uint8_t)Fast::F3DEX2_G_VTX) {
+            fp->vertex_load_count++;
+        } else if (opcode == (uint8_t)Fast::F3DEX2_G_TRI1) {
+            fp->tri1_count++;
+        } else if (opcode == (uint8_t)Fast::F3DEX2_G_TRI2) {
+            fp->tri2_count++;
+        }
+        dl++;
+    }
+}
+
+// TRACK B round 5: called once per unique tree-drawn DObj while Peach's
+// Castle or Final Destination is active (objdisplay.c dedups by pointer and
+// resets that set on scene/stage changes). No assumed stage root — this builds
+// a complete per-run inventory, static part
+// computed immediately, GPU-state part deferred to actual execution (see
+// gfx_dl_handler_common). If this DL is never actually walked by the
+// interpreter, no CASTLE_RUNTIME_DOBJ line appears for it at all — that
+// absence is itself a finding (registered but never executed).
+extern "C" void portArmCastleGpuStateCapture(const void* gobj, const void* dobj, const void* root_dl) {
+    if (root_dl == nullptr || sVitaCastleTrackedCount >= VITA_CASTLE_TRACKED_MAX) {
+        return;
+    }
+    VitaCastleTrackedEntry* entry = &sVitaCastleTracked[sVitaCastleTrackedCount++];
+    entry->dl = root_dl;
+    entry->gobj = gobj;
+    entry->dobj = dobj;
+    entry->captured = false;
+
+    uintptr_t file_base = 0;
+    entry->file_id = portRelocFindFileIdAndBase(root_dl, &file_base);
+    entry->resource_offset = (entry->file_id >= 0) ? (uint32_t)((uintptr_t)root_dl - file_base) : 0;
+
+    VitaCastleDLFingerprint fp = {};
+    fp.hash = 0xcbf29ce484222325ULL; /* FNV-1a offset basis */
+    WalkCastleDLFingerprint((F3DGfx*)root_dl, &fp, 0);
+    entry->dl_hash = fp.hash;
+    entry->root_command_count = fp.root_command_count;
+    entry->recursive_command_count = fp.recursive_command_count;
+    entry->nested_dl_count = fp.nested_dl_count;
+    entry->vertex_load_count = fp.vertex_load_count;
+    entry->tri1_count = fp.tri1_count;
+    entry->tri2_count = fp.tri2_count;
+    entry->truncated = fp.truncated;
+}
+#endif
 #endif
 
 void Interpreter::TextureCacheClear() {
@@ -1636,6 +1999,66 @@ static void Ssb64RenderDiagLogUpload(const char* decoder, const RawTexMetadata* 
                 height);
 }
 
+#ifdef __vita__
+static void Ssb64VitaLogDecodedUpload(const char* decoder, const RawTexMetadata* metadata, const void* addr,
+                                     int tile, uint32_t width, uint32_t height, const uint8_t* rgba) {
+    (void)metadata;
+    if (rgba == nullptr || width == 0 || height == 0) {
+        return;
+    }
+
+    const size_t pixels = static_cast<size_t>(width) * height;
+    uint8_t alphaMin = 255;
+    uint8_t alphaMax = 0;
+    uint32_t alphaZero = 0;
+    uint32_t alphaPartial = 0;
+    uint32_t alphaOpaque = 0;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < pixels; i++) {
+        const uint8_t alpha = rgba[i * 4 + 3];
+        alphaMin = std::min(alphaMin, alpha);
+        alphaMax = std::max(alphaMax, alpha);
+        alphaZero += alpha == 0;
+        alphaOpaque += alpha == 255;
+        alphaPartial += alpha != 0 && alpha != 255;
+        for (size_t component = 0; component < 4; component++) {
+            hash ^= rgba[i * 4 + component];
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+
+    /* Opaque-only uploads don't help diagnose the missing alpha mask and
+     * would consume the bounded hardware log before the HUD is reached. */
+    if (alphaZero == 0 && alphaPartial == 0) {
+        return;
+    }
+
+    static uint32_t logCount = 0;
+    if (logCount >= 192) {
+        return;
+    }
+    logCount++;
+
+    uintptr_t base = 0;
+    size_t resourceSize = 0;
+    uint32_t fileId = UINT32_MAX;
+    const char* path = nullptr;
+    bool registered = portRelocDescribePointer(addr, &base, &resourceSize, &fileId, &path);
+    port_log("SSB64: UI_TEXTURE_UPLOAD decoder=%s source=%p file_id=%u resource=%s offset=0x%x resource_size=%u "
+             "tile=%d upload=%ux%u pixels=%u alpha_min=%u alpha_max=%u alpha_zero=%u "
+             "alpha_partial=%u alpha_opaque=%u rgba_hash=%016llx\n",
+             decoder, addr, registered ? fileId : UINT32_MAX,
+             (registered && path != nullptr) ? path : "(unregistered)",
+             registered ? (unsigned)(reinterpret_cast<uintptr_t>(addr) - base) : 0U,
+             registered ? (unsigned)resourceSize : 0U, tile, width, height, (unsigned)pixels, alphaMin, alphaMax,
+             alphaZero, alphaPartial, alphaOpaque, (unsigned long long)hash);
+}
+#else
+static void Ssb64VitaLogDecodedUpload(const char*, const RawTexMetadata*, const void*, int,
+                                     uint32_t, uint32_t, const uint8_t*) {
+}
+#endif
+
 static void Ssb64RenderDiagLogDraw(const RawTexMetadata* metadata, const void* addr, int slot, int tile,
                                    uint32_t tmemIndex, uint8_t fmt, uint8_t siz, uint8_t cms, uint8_t cmt,
                                    uint8_t masks, uint8_t maskt, uint8_t shifts, uint8_t shiftt,
@@ -1746,6 +2169,7 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     }
 
     Ssb64RenderDiagLogUpload("RGBA16", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
+    Ssb64VitaLogDecodedUpload("RGBA16", metadata, addr, tile, width, height, mTexUploadBuffer);
     // Hi-res texture pack hook (port-side). Host hashes the decoded RGBA8
     // and substitutes a higher-resolution buffer if the pack contains one.
     // Skipped on importReplacement uploads (LUS's own alt-asset path).
@@ -1884,6 +2308,8 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
         }
     }
 
+    Ssb64VitaLogDecodedUpload("IA4", metadata, addr, tile, width, height, mTexUploadBuffer);
+
     if (!importReplacement) {
         if (GfxHiResHookFn hook = gHiResHook) {
             const uint8_t* packBuf = nullptr;
@@ -1940,6 +2366,8 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
             i++;
         }
     }
+
+    Ssb64VitaLogDecodedUpload("IA8", metadata, addr, tile, width, height, mTexUploadBuffer);
 
     if (!importReplacement) {
         if (GfxHiResHookFn hook = gHiResHook) {
@@ -2002,6 +2430,8 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
             i++;
         }
     }
+
+    Ssb64VitaLogDecodedUpload("IA16", metadata, addr, tile, width, height, mTexUploadBuffer);
 
     if (!importReplacement) {
         if (GfxHiResHookFn hook = gHiResHook) {
@@ -2232,6 +2662,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     }
 
     Ssb64RenderDiagLogUpload("CI4", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
+    Ssb64VitaLogDecodedUpload("CI4", metadata, addr, tile, width, height, mTexUploadBuffer);
     if (!importReplacement) {
         if (GfxHiResHookFn hook = gHiResHook) {
             const uint8_t* packBuf = nullptr;
@@ -2340,6 +2771,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     }
 
     Ssb64RenderDiagLogUpload("CI8", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
+    Ssb64VitaLogDecodedUpload("CI8", metadata, addr, tile, width, height, mTexUploadBuffer);
     if (!importReplacement) {
         if (GfxHiResHookFn hook = gHiResHook) {
             const uint8_t* packBuf = nullptr;
@@ -3506,6 +3938,99 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
     }
+#ifdef __vita__
+    // TRACK A round 2 (2026-08-21): the round-1 generic "any G_IM_FMT_IA
+    // tile" trace exhausted its budget entirely on unrelated IA sprites
+    // before scene 30 loaded — its use_alpha=yes result is NOT evidence
+    // Mario blends correctly. Replaced with an explicit correlation: only
+    // fires for the exact two TEXRECTs GfxDpTextureRectangle identified as
+    // Mario's M/A letters (armed via portArmMarioBackendTrace on scene-30
+    // entry). Queries REAL GL blend state (not just the tracked use_alpha
+    // shadow flag) — use_alpha=yes in the shader key is not sufficient
+    // proof; if the actual GL_BLEND enable/func diverges from what the
+    // combine state implies, that's the white-rectangle root cause.
+    if (sVitaMarioPendingLetter != 0) {
+        char letter = sVitaMarioPendingLetter;
+        bool already = (letter == 'M') ? sVitaMarioBackendCapturedM : sVitaMarioBackendCapturedA;
+        if (!already) {
+            if (letter == 'M') sVitaMarioBackendCapturedM = true; else sVitaMarioBackendCapturedA = true;
+            int gl_enabled = -1, gl_src_rgb = -1, gl_dst_rgb = -1, gl_src_a = -1, gl_dst_a = -1, gl_eq = -1;
+            unsigned char gl_color_mask[4] = { 0, 0, 0, 0 };
+            portQueryGLBlendState(&gl_enabled, &gl_src_rgb, &gl_dst_rgb, &gl_src_a, &gl_dst_a, &gl_eq, gl_color_mask);
+            port_log("SSB64: MARIO_BACKEND_DRAW letter=%c combine_mode=0x%016llx other_mode_l=0x%08x "
+                     "other_mode_h=0x%08x shader_id=0x%llx,0x%llx fragment_uses_alpha=%s "
+                     "GL_BLEND_ENABLED=%s GL_BLEND_SRC_RGB=0x%x GL_BLEND_DST_RGB=0x%x "
+                     "GL_BLEND_SRC_ALPHA=0x%x GL_BLEND_DST_ALPHA=0x%x GL_BLEND_EQUATION=0x%x "
+                     "color_write_mask=%u,%u,%u,%u backend_draw_called=yes\n",
+                     letter, (unsigned long long)key.combine_mode, (unsigned)mRdp->other_mode_l,
+                     (unsigned)mRdp->other_mode_h, (unsigned long long)comb->shader_id0,
+                     (unsigned long long)comb->shader_id1, use_alpha ? "yes" : "no",
+                     gl_enabled < 0 ? "unknown" : (gl_enabled ? "yes" : "no"), gl_src_rgb, gl_dst_rgb, gl_src_a,
+                     gl_dst_a, gl_eq, gl_color_mask[0], gl_color_mask[1], gl_color_mask[2], gl_color_mask[3]);
+
+            // TRACK A round 3: last piece of the pipeline — real depth/stencil
+            // state at the exact moment M/A's TEXRECT reaches the backend. If
+            // depth_test=yes and something drew nearer Z over this region
+            // afterward (see UI_DRAW_ORDER's depth_test/depth_write per
+            // primitive), that overwrite doesn't need to touch color at all.
+            int gl_depth_test = -1, gl_depth_func = -1, gl_depth_write = -1, gl_stencil_enabled = -1;
+            portQueryGLDepthState(&gl_depth_test, &gl_depth_func, &gl_depth_write, &gl_stencil_enabled);
+            port_log("SSB64: DEPTH_STATE letter=%c depth_test=%s depth_func=0x%x depth_write=%s "
+                     "stencil_enabled=%s color_write_mask=%u,%u,%u,%u\n",
+                     letter, gl_depth_test < 0 ? "unknown" : (gl_depth_test ? "yes" : "no"), gl_depth_func,
+                     gl_depth_write < 0 ? "unknown" : (gl_depth_write ? "yes" : "no"),
+                     gl_stencil_enabled < 0 ? "unknown" : (gl_stencil_enabled ? "yes" : "no"), gl_color_mask[0],
+                     gl_color_mask[1], gl_color_mask[2], gl_color_mask[3]);
+
+            // TRACK A round 4: complete RDP state at the exact moment this
+            // TEXRECT reaches the backend, plus the raw command history
+            // leading up to it — to catch state leaked from whatever drew
+            // immediately before this 2D pass (a stale combine/othermode/
+            // tile setup from a 3D draw that wasn't reset) rather than
+            // guessing from the aggregate combine_mode/other_mode_l alone.
+            {
+                uint32_t cyc = (unsigned)mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE);
+                const char* cycle_type_str = (cyc == (unsigned)G_CYC_COPY)    ? "COPY"
+                                             : (cyc == (unsigned)G_CYC_FILL)  ? "FILL"
+                                             : (cyc == (unsigned)G_CYC_2CYCLE) ? "2CYCLE"
+                                                                              : "1CYCLE";
+                uint32_t alpha_compare = (mRdp->other_mode_l >> G_MDSFT_ALPHACOMPARE) & 3U;
+                uint32_t tmem_idx0 = mRdp->texture_tile[0].tmem_index;
+                port_log("SSB64: RDP_STATE_BEFORE_TEXRECT letter=%c cycle_type=%s combine_mode=0x%016llx "
+                         "other_mode_h=0x%08x other_mode_l=0x%08x texture_image=%p texture_format=%u "
+                         "texture_size=%u texture_width=%u tile0_format=%u tile0_size=%u tile0_line=%u "
+                         "tile0_tmem=%u tile0_palette=%u tile0_cms=%u tile0_cmt=%u tile0_masks=%u "
+                         "tile0_maskt=%u render_mode=%s alpha_compare=%u blend_enable=%s geometry_mode=0x%x "
+                         "viewport=(%.2f,%.2f %.2fx%.2f) scissor=(%.2f,%.2f %.2fx%.2f) matrix_stack_depth=%u\n",
+                         letter, cycle_type_str, (unsigned long long)key.combine_mode, (unsigned)mRdp->other_mode_h,
+                         (unsigned)mRdp->other_mode_l, (const void*)mRdp->texture_to_load.addr,
+                         (unsigned)mRdp->texture_to_load.siz, (unsigned)mRdp->loaded_texture[tmem_idx0].size_bytes,
+                         (unsigned)mRdp->texture_to_load.width, (unsigned)mRdp->texture_tile[0].fmt,
+                         (unsigned)mRdp->texture_tile[0].siz, (unsigned)mRdp->texture_tile[0].line_size_bytes,
+                         (unsigned)mRdp->texture_tile[0].tmem, (unsigned)mRdp->texture_tile[0].palette,
+                         (unsigned)mRdp->texture_tile[0].cms, (unsigned)mRdp->texture_tile[0].cmt,
+                         (unsigned)mRdp->texture_tile[0].masks, (unsigned)mRdp->texture_tile[0].maskt,
+                         use_alpha ? "XLU-like" : "OPA-like", alpha_compare, use_alpha ? "yes" : "no",
+                         (unsigned)mRsp->geometry_mode, (double)mRdp->viewport.x, (double)mRdp->viewport.y,
+                         (double)mRdp->viewport.width, (double)mRdp->viewport.height, (double)mRdp->scissor.x,
+                         (double)mRdp->scissor.y, (double)mRdp->scissor.width, (double)mRdp->scissor.height,
+                         (unsigned)mRsp->modelview_matrix_stack_size);
+
+                uint32_t hist_n = sVitaCmdHistoryTotal < VITA_CMD_HISTORY_SIZE ? sVitaCmdHistoryTotal
+                                                                               : VITA_CMD_HISTORY_SIZE;
+                for (uint32_t hi = 0; hi < hist_n; hi++) {
+                    int idx = ((sVitaCmdHistoryPos - (int)hist_n + (int)hi) % VITA_CMD_HISTORY_SIZE +
+                               VITA_CMD_HISTORY_SIZE) %
+                              VITA_CMD_HISTORY_SIZE;
+                    VitaCmdHistoryEntry* h = &sVitaCmdHistory[idx];
+                    port_log("SSB64: CMD_HISTORY letter=%c order=%u opcode=%s w0=0x%016llx w1=0x%016llx\n", letter,
+                             hi, VitaOpcodeName(h->opcode), (unsigned long long)h->w0, (unsigned long long)h->w1);
+                }
+            }
+        }
+        sVitaMarioPendingLetter = 0;
+    }
+#endif
     uint8_t numInputs;
     bool usedTextures[2];
 
@@ -3897,6 +4422,19 @@ void Interpreter::CalcAndSetViewport(const F3DVp_t* viewport) {
     mRdp->viewport.height = height;
 
     AdjustVIewportOrScissor(&mRdp->viewport);
+#ifdef __vita__
+    if (!sVitaViewportSnapshot.captured && sVitaTotalFrameCount > VITA_TRACKC_SETTLE_FRAMES) {
+        sVitaViewportSnapshot.captured = true;
+        sVitaViewportSnapshot.raw_x = x;
+        sVitaViewportSnapshot.raw_y = y;
+        sVitaViewportSnapshot.raw_w = width;
+        sVitaViewportSnapshot.raw_h = height;
+        sVitaViewportSnapshot.adj_x = mRdp->viewport.x;
+        sVitaViewportSnapshot.adj_y = mRdp->viewport.y;
+        sVitaViewportSnapshot.adj_w = mRdp->viewport.width;
+        sVitaViewportSnapshot.adj_h = mRdp->viewport.height;
+    }
+#endif
 
     mRdp->viewport_or_scissor_changed = true;
 }
@@ -4118,6 +4656,10 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
     mRdp->scissor.width = width;
     mRdp->scissor.height = height;
 
+#ifdef __vita__
+    bool trackCArm = !sVitaScissorSnapshot.captured && sVitaTotalFrameCount > VITA_TRACKC_SETTLE_FRAMES;
+#endif
+
     AdjustVIewportOrScissor(&mRdp->scissor);
 
     // SSB64 port: when the tight-4:3-scissor hook is active alongside
@@ -4141,6 +4683,42 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
             }
         }
     }
+
+#ifdef __vita__
+    if (!mFbActive) {
+        const int32_t canvas_y = (int32_t)mGfxCurrentWindowDimensions.height -
+                                 ((int32_t)mGameWindowViewport.y + (int32_t)mGameWindowViewport.height);
+        sVitaDefaultSafeAreaScissorActive =
+            VitaIsDefaultSafeAreaRect(mRdp->scissor, mGameWindowViewport.x, canvas_y,
+                                      mGameWindowViewport.width, mGameWindowViewport.height);
+        if (sVitaDefaultSafeAreaScissorActive) {
+            mRdp->scissor.x = (int16_t)mGameWindowViewport.x;
+            mRdp->scissor.y = (int16_t)canvas_y;
+            mRdp->scissor.width = mGameWindowViewport.width;
+            mRdp->scissor.height = mGameWindowViewport.height;
+        }
+    } else {
+        sVitaDefaultSafeAreaScissorActive = false;
+    }
+#endif
+
+#ifdef __vita__
+    if (trackCArm) {
+        sVitaScissorSnapshot.captured = true;
+        sVitaScissorSnapshot.raw_x = x;
+        sVitaScissorSnapshot.raw_y = y;
+        sVitaScissorSnapshot.raw_w = width;
+        sVitaScissorSnapshot.raw_h = height;
+        sVitaScissorSnapshot.n64_xmin = ulx / 4.0f;
+        sVitaScissorSnapshot.n64_ymin = uly / 4.0f;
+        sVitaScissorSnapshot.n64_xmax = lrx / 4.0f;
+        sVitaScissorSnapshot.n64_ymax = lry / 4.0f;
+        sVitaScissorSnapshot.adj_x = mRdp->scissor.x;
+        sVitaScissorSnapshot.adj_y = mRdp->scissor.y;
+        sVitaScissorSnapshot.adj_w = mRdp->scissor.width;
+        sVitaScissorSnapshot.adj_h = mRdp->scissor.height;
+    }
+#endif
 
     mRdp->viewport_or_scissor_changed = true;
 }
@@ -4670,6 +5248,14 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     uint32_t geometry_mode_saved = mRsp->geometry_mode;
 
     AdjustVIewportOrScissor(&default_viewport);
+#ifdef __vita__
+    if (!mFbActive && sVitaDefaultSafeAreaScissorActive) {
+        const int32_t canvas_y = (int32_t)mGfxCurrentWindowDimensions.height -
+                                 ((int32_t)mGameWindowViewport.y + (int32_t)mGameWindowViewport.height);
+        VitaApplySafeAreaCropToCanvas(&default_viewport, mGameWindowViewport.x, canvas_y,
+                                      mGameWindowViewport.width, mGameWindowViewport.height);
+    }
+#endif
 
     mRdp->viewport = default_viewport;
     mRdp->viewport_or_scissor_changed = true;
@@ -4715,6 +5301,45 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     if (RdpColorImageIsZBuffer()) {
         return;
     }
+#ifdef __vita__
+    {
+        float px0 = ulx / 4.0f, py0 = uly / 4.0f, px1 = lrx / 4.0f, py1 = lry / 4.0f;
+        if (sVitaMarioBackendArmed && !(sVitaMarioBackendCapturedM && sVitaMarioBackendCapturedA)) {
+            if (!sVitaMarioBackendCapturedM && VitaRectsIntersect(px0, py0, px1, py1, kVitaMarioLetterM)) {
+                sVitaMarioPendingLetter = 'M';
+            } else if (!sVitaMarioBackendCapturedA && VitaRectsIntersect(px0, py0, px1, py1, kVitaMarioLetterA)) {
+                sVitaMarioPendingLetter = 'A';
+            }
+        }
+        if (!sVitaUiDrawOrderDone && sVitaUiDrawOrderArmFrame != 0 &&
+            sVitaTotalFrameCount == sVitaUiDrawOrderArmFrame &&
+            VitaRectsIntersect(px0, py0, px1, py1, kVitaUiDrawOrderRegion)) {
+            if (sVitaUiDrawOrderSeq >= VITA_UI_DRAW_ORDER_MAX) {
+                sVitaUiDrawOrderDone = true;
+            } else {
+                uint32_t tmem_idx = mRdp->texture_tile[tile].tmem_index;
+                bool depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
+                bool depth_write = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+                bool blend_enabled = VitaComputeUseAlpha(mRdp->other_mode_l);
+                const void* src_gobj = nullptr;
+                const void* src_sobj = nullptr;
+                bool have_source = VitaPopUiDrawSource(&src_gobj, &src_sobj);
+                port_log("SSB64: UI_ORDER sequence=%u type=TEXRECT bounds=(%.1f,%.1f %.1fx%.1f) "
+                         "gobj=%p sobj=%p fmt=%u siz=%u address=%p prim=%u,%u,%u,%u env=%u,%u,%u,%u "
+                         "combine=0x%016llx render_mode=%s blend_enabled=%s "
+                         "depth_test=%s depth_write=%s\n",
+                         sVitaUiDrawOrderSeq++, px0, py0, px1 - px0, py1 - py0, src_gobj, src_sobj,
+                         (unsigned)mRdp->texture_tile[tile].fmt, (unsigned)mRdp->texture_tile[tile].siz,
+                         (const void*)mRdp->loaded_texture[tmem_idx].addr, (unsigned)mRdp->prim_color.r,
+                         (unsigned)mRdp->prim_color.g, (unsigned)mRdp->prim_color.b, (unsigned)mRdp->prim_color.a,
+                         (unsigned)mRdp->env_color.r, (unsigned)mRdp->env_color.g, (unsigned)mRdp->env_color.b,
+                         (unsigned)mRdp->env_color.a, (unsigned long long)mRdp->combine_mode,
+                         blend_enabled ? "XLU-like" : "OPA-like", blend_enabled ? "yes" : "no",
+                         depth_test ? "yes" : "no", depth_write ? "yes" : "no");
+            }
+        }
+    }
+#endif
     // printf("render %d at %d\n", tile, lrx);
     uint64_t saved_combine_mode = mRdp->combine_mode;
     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
@@ -4867,6 +5492,29 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         return;
     }
     uint32_t mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
+
+#ifdef __vita__
+    if (!sVitaUiDrawOrderDone && sVitaUiDrawOrderArmFrame != 0 && sVitaTotalFrameCount == sVitaUiDrawOrderArmFrame) {
+        float px0 = ulx / 4.0f, py0 = uly / 4.0f, px1 = lrx / 4.0f, py1 = lry / 4.0f;
+        if (VitaRectsIntersect(px0, py0, px1, py1, kVitaUiDrawOrderRegion)) {
+            if (sVitaUiDrawOrderSeq >= VITA_UI_DRAW_ORDER_MAX) {
+                sVitaUiDrawOrderDone = true;
+            } else {
+                bool fr_depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
+                bool fr_depth_write = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+                bool fr_blend_enabled = VitaComputeUseAlpha(mRdp->other_mode_l);
+                port_log("SSB64: UI_ORDER sequence=%u type=FILLRECT bounds=(%.1f,%.1f %.1fx%.1f) "
+                         "gobj=(nil) sobj=(nil) fill=%u,%u,%u,%u combine=0x%016llx render_mode=%s "
+                         "blend_enabled=%s depth_test=%s depth_write=%s\n",
+                         sVitaUiDrawOrderSeq++, px0, py0, px1 - px0, py1 - py0, (unsigned)mRdp->fill_color.r,
+                         (unsigned)mRdp->fill_color.g, (unsigned)mRdp->fill_color.b, (unsigned)mRdp->fill_color.a,
+                         (unsigned long long)mRdp->combine_mode, fr_blend_enabled ? "XLU-like" : "OPA-like",
+                         fr_blend_enabled ? "yes" : "no", fr_depth_test ? "yes" : "no",
+                         fr_depth_write ? "yes" : "no");
+            }
+        }
+    }
+#endif
 
     // OTRTODO: This is a bit of a hack for widescreen screen fades, but it'll work for now...
     if (ulx == 0 && uly == 0 && lrx == (319 * 4) && lry == (239 * 4)) {
@@ -5679,6 +6327,50 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
         }
     }
 
+#ifdef __vita__
+    for (int ti = 0; ti < sVitaCastleTrackedCount; ti++) {
+        VitaCastleTrackedEntry* entry = &sVitaCastleTracked[ti];
+        if (entry->captured || subGFX != entry->dl) {
+            continue;
+        }
+        entry->captured = true;
+        uint64_t proj_hash = FnvHashBytes(0xcbf29ce484222325ULL, gfx->mRsp->P_matrix, sizeof(gfx->mRsp->P_matrix));
+        uint64_t mv_top_hash = 0;
+        if (gfx->mRsp->modelview_matrix_stack_size > 0) {
+            mv_top_hash = FnvHashBytes(0xcbf29ce484222325ULL,
+                                       gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1],
+                                       sizeof(gfx->mRsp->modelview_matrix_stack[0]));
+        }
+        uint32_t cull_front_bit = get_attr(CULL_FRONT);
+        uint32_t cull_back_bit = get_attr(CULL_BACK);
+        uint32_t tile = gfx->mRdp->first_tile_index;
+        uint32_t tmem_idx = gfx->mRdp->texture_tile[tile].tmem_index;
+        const uint8_t* tex_addr = gfx->mRdp->loaded_texture[tmem_idx].addr;
+        uint32_t tex_size = gfx->mRdp->loaded_texture[tmem_idx].size_bytes;
+        uint64_t tex_hash = 0;
+        if (tex_addr != nullptr && tex_size > 0) {
+            uint32_t hash_len = tex_size < 8192 ? tex_size : 8192;
+            tex_hash = FnvHashBytes(0xcbf29ce484222325ULL, tex_addr, hash_len);
+        }
+        port_log("SSB64: CASTLE_RUNTIME_DOBJ gobj=%p dobj=%p resource=reloc_file_%d file_id=%d offset=%u dl=%p "
+                 "dl_hash=0x%016llx command_count=%u recursive_command_count=%u nested_dl_count=%u "
+                 "vertex_load_count=%u tri1_count=%u tri2_count=%u truncated=%s "
+                 "matrix_hash=0x%016llx projection_hash=0x%016llx geometry_mode=0x%x cull_front=%s cull_back=%s "
+                 "zbuffer=%s lighting=%s texture_address=%p fmt=%u siz=%u texture_hash=0x%016llx\n",
+                 entry->gobj, entry->dobj, entry->file_id, entry->file_id, entry->resource_offset, subGFX,
+                 (unsigned long long)entry->dl_hash, entry->root_command_count, entry->recursive_command_count,
+                 entry->nested_dl_count, entry->vertex_load_count, entry->tri1_count, entry->tri2_count,
+                 entry->truncated ? "yes" : "no", (unsigned long long)mv_top_hash, (unsigned long long)proj_hash,
+                 (unsigned)gfx->mRsp->geometry_mode, (gfx->mRsp->geometry_mode & cull_front_bit) ? "yes" : "no",
+                 (gfx->mRsp->geometry_mode & cull_back_bit) ? "yes" : "no",
+                 (gfx->mRsp->geometry_mode & G_ZBUFFER) ? "yes" : "no",
+                 (gfx->mRsp->geometry_mode & G_LIGHTING) ? "yes" : "no", (const void*)tex_addr,
+                 (unsigned)gfx->mRdp->texture_tile[tile].fmt, (unsigned)gfx->mRdp->texture_tile[tile].siz,
+                 (unsigned long long)tex_hash);
+        break;
+    }
+#endif
+
     /* DL-range bounds check. Reject push if subGFX would walk into a
      * page that's about to fault. Two cases caught here:
      *   - Unresolved N64 segments (≤ 0x0FFFFFFF): no segment-table entry,
@@ -5709,6 +6401,29 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
          * the cases we've measured. */
         uintptr_t subAddr = (uintptr_t)subGFX;
         if (sDLBoundsCheck && sDLBoundsCheck(subAddr) == kDLBoundsWalkedPast) {
+#ifdef __vita__
+            // TRACK B (2026-08-21): Peach's Castle intermittent-geometry
+            // investigation. This reject path is a plausible root cause for
+            // "same build, same stage, piece visible in run A / missing in
+            // run B": it's a conservative guess (kDLBoundsWalkedPast) based
+            // on heap layout, which can differ between cold launches. It was
+            // previously silent on Vita — SPDLOG has zero sinks here (no
+            // file/console sink is wired for __vita__), so every one of
+            // these rejects went completely unlogged on real hardware.
+            // sVitaDLRejectTotal is never reset/budgeted so it survives the
+            // whole run and shows up in the periodic report below even if
+            // the bounded per-event trace has gone silent.
+            sVitaDLRejectTotal++;
+            {
+                static int sVitaDLRejectLogBudget = 20;
+                if (sVitaDLRejectLogBudget > 0) {
+                    sVitaDLRejectLogBudget--;
+                    port_log("SSB64: DL_REJECT_WALKED_PAST total=%llu w1=0x%llx subAddr=0x%llx depth=%d\n",
+                             (unsigned long long)sVitaDLRejectTotal, (unsigned long long)cmd->words.w1,
+                             (unsigned long long)subAddr, (int)g_exec_stack.cmd_stack.size());
+                }
+            }
+#else
             static int sRejectCount = 0;
             if (sRejectCount < 10) {
                 sRejectCount++;
@@ -5719,6 +6434,7 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                             (unsigned long long)subAddr);
                 Fast::DumpDLDiag(subGFX, "gfx_dl_handler: walked-past");
             }
+#endif
             return false;
         }
     }
@@ -6861,6 +7577,12 @@ static void gfx_step() {
 
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
+#ifdef __vita__
+    sVitaCmdHistory[sVitaCmdHistoryPos] = { (uint8_t)opcode, (uint64_t)cmd->words.w0, (uint64_t)cmd->words.w1 };
+    sVitaCmdHistoryPos = (sVitaCmdHistoryPos + 1) % VITA_CMD_HISTORY_SIZE;
+    sVitaCmdHistoryTotal++;
+#endif
+
     if (sGbiTraceCallback) {
         sGbiTraceCallback((uintptr_t)cmd->words.w0, (uintptr_t)cmd->words.w1,
                           (int)g_exec_stack.cmd_stack.size() - 1);
@@ -7541,8 +8263,43 @@ void Interpreter::EndFrame() {
     mRapi->FinishRender();
     mWapi->SwapBuffersEnd();
 #ifdef __vita__
+    sVitaTotalFrameCount++;
+    if (!sVitaTrackCReported && sVitaViewportSnapshot.captured && sVitaScissorSnapshot.captured) {
+        sVitaTrackCReported = true;
+        float trackc_x_scale = (mNativeDimensions.width > 0) ? (float)mCurDimensions.width / (float)mNativeDimensions.width : 0.0f;
+        float trackc_y_scale = (mNativeDimensions.height > 0) ? (float)mCurDimensions.height / (float)mNativeDimensions.height : 0.0f;
+        port_log("SSB64: TRACKC_VIEWPORT_SCISSOR frame=%llu "
+                 "n64_logical=%dx%d gfx_native=%ux%u cur_dimensions=%ux%u game_window_viewport=(%d,%d %ux%u) "
+                 "n64_viewport_raw=(%.2f,%.2f %.2fx%.2f) physical_viewport=(%.2f,%.2f %.2fx%.2f) "
+                 "n64_scissor_raw=(%.2f,%.2f %.2fx%.2f) physical_scissor=(%.2f,%.2f %.2fx%.2f) "
+                 "n64_scissor_xmin_ymin_xmax_ymax=(%.2f,%.2f,%.2f,%.2f) "
+                 "aspect_correction_factor_x=%.4f aspect_correction_factor_y=%.4f "
+                 "widescreen_active=%s widescreen_clip_x_scale=%.4f tight_4_3_scissor_window=%s "
+                 "widescreen_fb_persistence=%s\n",
+                 (unsigned long long)sVitaTotalFrameCount,
+                 SCREEN_WIDTH, SCREEN_HEIGHT,
+                 (unsigned)mNativeDimensions.width, (unsigned)mNativeDimensions.height,
+                 (unsigned)mCurDimensions.width, (unsigned)mCurDimensions.height,
+                 (int)mGameWindowViewport.x, (int)mGameWindowViewport.y,
+                 (unsigned)mGameWindowViewport.width, (unsigned)mGameWindowViewport.height,
+                 sVitaViewportSnapshot.raw_x, sVitaViewportSnapshot.raw_y,
+                 sVitaViewportSnapshot.raw_w, sVitaViewportSnapshot.raw_h,
+                 sVitaViewportSnapshot.adj_x, sVitaViewportSnapshot.adj_y,
+                 sVitaViewportSnapshot.adj_w, sVitaViewportSnapshot.adj_h,
+                 sVitaScissorSnapshot.raw_x, sVitaScissorSnapshot.raw_y,
+                 sVitaScissorSnapshot.raw_w, sVitaScissorSnapshot.raw_h,
+                 sVitaScissorSnapshot.adj_x, sVitaScissorSnapshot.adj_y,
+                 sVitaScissorSnapshot.adj_w, sVitaScissorSnapshot.adj_h,
+                 sVitaScissorSnapshot.n64_xmin, sVitaScissorSnapshot.n64_ymin,
+                 sVitaScissorSnapshot.n64_xmax, sVitaScissorSnapshot.n64_ymax,
+                 (double)trackc_x_scale, (double)trackc_y_scale,
+                 mWidescreenActive ? "yes" : "no", (double)GetWidescreenClipXScale(),
+                 mTight4_3ScissorWindow ? "yes" : "no",
+                 mWidescreenFramebufferPersistence ? "yes" : "no");
+    }
     sVitaTextureCacheStats.frames++;
     if (sVitaTextureCacheStats.frames >= 300) {
+        port_log("SSB64: DLREJECT total=%llu\n", (unsigned long long)sVitaDLRejectTotal);
         port_log("SSB64: TEXCACHE frames=%u entries=%u lookups=%u hits=%u misses=%u stale=%u evictions=%u new_ids=%u reused_ids=%u hash_kib=%u palette_kib=%u\n",
                  sVitaTextureCacheStats.frames, (uint32_t)mTextureCache.map.size(),
                  sVitaTextureCacheStats.lookups, sVitaTextureCacheStats.hits, sVitaTextureCacheStats.misses,

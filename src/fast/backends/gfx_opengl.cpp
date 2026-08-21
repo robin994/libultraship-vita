@@ -1003,6 +1003,14 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
         return;
     }
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
+#ifdef __vita__
+    GLenum uploadError = glGetError();
+    if (uploadError != GL_NO_ERROR) {
+        port_log("SSB64: GPU_TEXTURE_UPLOAD status=FAIL texture_id=%u tile=%u width=%u height=%u gl_error=0x%x\n",
+                 (unsigned)mCurrentTextureIds[mCurrentTile], (unsigned)mCurrentTile, width, height,
+                 (unsigned)uploadError);
+    }
+#endif
 }
 
 #ifdef USE_OPENGLES
@@ -1070,6 +1078,55 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
         }
     }
 }
+
+#ifdef __vita__
+// TRACK A round 2 (2026-08-21): ground-truth GL blend/color-write state for
+// the Mario M/A white-rectangle investigation. use_alpha=yes in the shader
+// key (interpreter.cpp's tracked flag) is not sufficient proof the GPU is
+// actually blending — this queries the driver directly, called right after
+// SetUseAlpha/shader setup for the exact TEXRECT identified as Mario's M or
+// A letter (see MARIO_BACKEND_DRAW in interpreter.cpp).
+extern "C" void portQueryGLBlendState(int* enabled, int* src_rgb, int* dst_rgb, int* src_alpha, int* dst_alpha,
+                                      int* equation, unsigned char color_mask[4]) {
+    GLboolean gl_enabled = GL_FALSE;
+    GLint gl_src_rgb = 0, gl_dst_rgb = 0, gl_src_alpha = 0, gl_dst_alpha = 0, gl_eq = 0;
+    GLboolean gl_color_mask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
+    glGetBooleanv(GL_BLEND, &gl_enabled);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &gl_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &gl_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &gl_src_alpha);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &gl_dst_alpha);
+    glGetIntegerv(GL_BLEND_EQUATION, &gl_eq);
+    glGetBooleanv(GL_COLOR_WRITEMASK, gl_color_mask);
+    *enabled = gl_enabled ? 1 : 0;
+    *src_rgb = (int)gl_src_rgb;
+    *dst_rgb = (int)gl_dst_rgb;
+    *src_alpha = (int)gl_src_alpha;
+    *dst_alpha = (int)gl_dst_alpha;
+    *equation = (int)gl_eq;
+    color_mask[0] = gl_color_mask[0] ? 1 : 0;
+    color_mask[1] = gl_color_mask[1] ? 1 : 0;
+    color_mask[2] = gl_color_mask[2] ? 1 : 0;
+    color_mask[3] = gl_color_mask[3] ? 1 : 0;
+}
+
+// TRACK A round 3 (2026-08-21): DEPTH_STATE — the last untested link in the
+// Mario white-rectangle pipeline. Ground truth from the driver, not the
+// tracked mCurrentDepthTest/mLastDepthTest shadow state, for the same reason
+// portQueryGLBlendState queries real GL_BLEND instead of trusting use_alpha.
+extern "C" void portQueryGLDepthState(int* depth_test, int* depth_func, int* depth_write, int* stencil_enabled) {
+    GLboolean gl_depth_test = GL_FALSE, gl_depth_write = GL_TRUE, gl_stencil_enabled = GL_FALSE;
+    GLint gl_depth_func = 0;
+    glGetBooleanv(GL_DEPTH_TEST, &gl_depth_test);
+    glGetIntegerv(GL_DEPTH_FUNC, &gl_depth_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &gl_depth_write);
+    glGetBooleanv(GL_STENCIL_TEST, &gl_stencil_enabled);
+    *depth_test = gl_depth_test ? 1 : 0;
+    *depth_func = (int)gl_depth_func;
+    *depth_write = gl_depth_write ? 1 : 0;
+    *stencil_enabled = gl_stencil_enabled ? 1 : 0;
+}
+#endif
 
 // SSB64 port: draw-dump debug feature (see port/gameloop.cpp SSB64_DUMP_DRAWS).
 // Armed externally; writes a numbered snapshot of the current draw target on
