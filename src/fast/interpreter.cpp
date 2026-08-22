@@ -488,6 +488,115 @@ struct VitaFast3DStats {
 };
 
 static VitaFast3DStats sVitaFast3DStats = {};
+
+/* v12 targeted fighter-geometry diagnostics.
+ * File IDs are stable entries from the generated SSB64 reloc manifest:
+ *   296 MarioModel
+ *   313 FoxModel
+ * This is observation-only: it never changes clip/cull/shader decisions. */
+static constexpr uint32_t kVitaMarioModelFileId = 296u;
+static constexpr uint32_t kVitaFoxModelFileId = 313u;
+static uint32_t sVitaFighterVertexSource[MAX_VERTICES + 4] = {};
+
+struct VitaFighterGeomStats {
+    uint32_t file_id;
+    uint64_t vtx_cmds;
+    uint64_t vertices_loaded;
+    uint64_t tris_requested;
+    uint64_t tris_clip_rejected;
+    uint64_t tris_cull_front;
+    uint64_t tris_cull_back;
+    uint64_t tris_cull_both;
+    uint64_t tris_shader_failed;
+    uint64_t tris_emitted;
+    uint64_t tris_mixed_source;
+    uint32_t vtx_trace_lines;
+    uint32_t reject_trace_lines;
+    uint64_t last_summary_bucket;
+};
+
+static VitaFighterGeomStats sVitaMarioGeomStats = { kVitaMarioModelFileId };
+static VitaFighterGeomStats sVitaFoxGeomStats = { kVitaFoxModelFileId };
+
+static VitaFighterGeomStats* VitaFighterGeomStatsForFile(uint32_t file_id) {
+    if (file_id == kVitaMarioModelFileId) {
+        return &sVitaMarioGeomStats;
+    }
+    if (file_id == kVitaFoxModelFileId) {
+        return &sVitaFoxGeomStats;
+    }
+    return nullptr;
+}
+
+static void VitaFighterGeomMaybeSummary(VitaFighterGeomStats* stats, bool force = false) {
+    if (stats == nullptr) {
+        return;
+    }
+    const uint64_t bucket = stats->tris_requested / 256u;
+    if (!force && (stats->tris_requested == 0 || bucket == stats->last_summary_bucket)) {
+        return;
+    }
+    stats->last_summary_bucket = bucket;
+    port_log("SSB64: FIGHTER_GEOM_SUMMARY file=%u ucode=%u vtx_cmds=%llu vertices=%llu "
+             "tris=%llu clip=%llu cull_front=%llu cull_back=%llu cull_both=%llu "
+             "shader_fail=%llu emitted=%llu mixed=%llu\n",
+             stats->file_id, 4u, /* ucode_f3dex2 */
+             (unsigned long long)stats->vtx_cmds,
+             (unsigned long long)stats->vertices_loaded,
+             (unsigned long long)stats->tris_requested,
+             (unsigned long long)stats->tris_clip_rejected,
+             (unsigned long long)stats->tris_cull_front,
+             (unsigned long long)stats->tris_cull_back,
+             (unsigned long long)stats->tris_cull_both,
+             (unsigned long long)stats->tris_shader_failed,
+             (unsigned long long)stats->tris_emitted,
+             (unsigned long long)stats->tris_mixed_source);
+}
+
+static VitaFighterGeomStats* VitaFighterGeomTriStats(uint8_t a, uint8_t b, uint8_t c) {
+    if (a >= MAX_VERTICES + 4 || b >= MAX_VERTICES + 4 || c >= MAX_VERTICES + 4) {
+        return nullptr;
+    }
+
+    const uint32_t fa = sVitaFighterVertexSource[a];
+    const uint32_t fb = sVitaFighterVertexSource[b];
+    const uint32_t fc = sVitaFighterVertexSource[c];
+
+    if (fa == fb && fb == fc) {
+        return VitaFighterGeomStatsForFile(fa);
+    }
+
+    VitaFighterGeomStats* stats = nullptr;
+    if (VitaFighterGeomStatsForFile(fa) != nullptr) {
+        stats = VitaFighterGeomStatsForFile(fa);
+    } else if (VitaFighterGeomStatsForFile(fb) != nullptr) {
+        stats = VitaFighterGeomStatsForFile(fb);
+    } else if (VitaFighterGeomStatsForFile(fc) != nullptr) {
+        stats = VitaFighterGeomStatsForFile(fc);
+    }
+    if (stats != nullptr) {
+        stats->tris_mixed_source++;
+    }
+    return stats;
+}
+
+static void VitaFighterGeomTraceReject(VitaFighterGeomStats* stats, const char* reason,
+                                       uint8_t i1, uint8_t i2, uint8_t i3,
+                                       const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3,
+                                       uint32_t geometry_mode) {
+    if (stats == nullptr || stats->reject_trace_lines >= 24u) {
+        return;
+    }
+    stats->reject_trace_lines++;
+    port_log("SSB64: FIGHTER_GEOM_REJECT file=%u reason=%s idx=%u,%u,%u gm=0x%08x "
+             "clip=%02x/%02x/%02x p0=(%.3f,%.3f,%.3f,%.3f) "
+             "p1=(%.3f,%.3f,%.3f,%.3f) p2=(%.3f,%.3f,%.3f,%.3f)\n",
+             stats->file_id, reason, i1, i2, i3, geometry_mode,
+             v1->clip_rej, v2->clip_rej, v3->clip_rej,
+             v1->x, v1->y, v1->z, v1->w,
+             v2->x, v2->y, v2->z, v2->w,
+             v3->x, v3->y, v3->z, v3->w);
+}
 #endif
 
 namespace Fast {
@@ -3653,11 +3762,26 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+#ifdef __vita__
+    VitaFighterGeomStats* fighter_geom_stats =
+        is_rect ? nullptr : VitaFighterGeomTriStats(vtx1_idx, vtx2_idx, vtx3_idx);
+    if (fighter_geom_stats != nullptr) {
+        fighter_geom_stats->tris_requested++;
+    }
+#endif
 
     // if (rand()%2) return;
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
+#ifdef __vita__
+        if (fighter_geom_stats != nullptr) {
+            fighter_geom_stats->tris_clip_rejected++;
+            VitaFighterGeomTraceReject(fighter_geom_stats, "clip", vtx1_idx, vtx2_idx, vtx3_idx,
+                                       v1, v2, v3, mRsp->geometry_mode);
+            VitaFighterGeomMaybeSummary(fighter_geom_stats);
+        }
+#endif
         return;
     }
 
@@ -3688,14 +3812,38 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
         if (cull_type == cull_front) {
             if (cross <= 0) {
+#ifdef __vita__
+                if (fighter_geom_stats != nullptr) {
+                    fighter_geom_stats->tris_cull_front++;
+                    VitaFighterGeomTraceReject(fighter_geom_stats, "cull-front", vtx1_idx, vtx2_idx, vtx3_idx,
+                                               v1, v2, v3, mRsp->geometry_mode);
+                    VitaFighterGeomMaybeSummary(fighter_geom_stats);
+                }
+#endif
                 return;
             }
         } else if (cull_type == cull_back) {
             if (cross >= 0) {
+#ifdef __vita__
+                if (fighter_geom_stats != nullptr) {
+                    fighter_geom_stats->tris_cull_back++;
+                    VitaFighterGeomTraceReject(fighter_geom_stats, "cull-back", vtx1_idx, vtx2_idx, vtx3_idx,
+                                               v1, v2, v3, mRsp->geometry_mode);
+                    VitaFighterGeomMaybeSummary(fighter_geom_stats);
+                }
+#endif
                 return;
             }
         } else if (cull_type == cull_both) {
             // Why is this even an option?
+#ifdef __vita__
+            if (fighter_geom_stats != nullptr) {
+                fighter_geom_stats->tris_cull_both++;
+                VitaFighterGeomTraceReject(fighter_geom_stats, "cull-both", vtx1_idx, vtx2_idx, vtx3_idx,
+                                           v1, v2, v3, mRsp->geometry_mode);
+                VitaFighterGeomMaybeSummary(fighter_geom_stats);
+            }
+#endif
             return;
         }
     }
@@ -3979,6 +4127,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
     }
     if (prg == NULL) {
+#ifdef __vita__
+        if (fighter_geom_stats != nullptr) {
+            fighter_geom_stats->tris_shader_failed++;
+            VitaFighterGeomTraceReject(fighter_geom_stats, "shader-fail", vtx1_idx, vtx2_idx, vtx3_idx,
+                                       v1, v2, v3, mRsp->geometry_mode);
+            VitaFighterGeomMaybeSummary(fighter_geom_stats);
+        }
+#endif
         return; // Shader compile failed — skip this draw call
     }
     if (prg != mRenderingState.mShaderProgram) {
@@ -4085,6 +4241,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         sVitaMarioPendingLetter = 0;
     }
 #endif
+#ifdef __vita__
+    if (fighter_geom_stats != nullptr) {
+        fighter_geom_stats->tris_emitted++;
+        VitaFighterGeomMaybeSummary(fighter_geom_stats);
+    }
+#endif
+
     uint8_t numInputs;
     bool usedTextures[2];
 
@@ -6191,6 +6354,42 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     // Lazy vertex byte-order fixup (port-side, Option A).
     // Per-vertex idempotency handles overlapping sub-region reloads.
     portRelocFixupVertexAtRuntime((const void*)vertices, n_vertices);
+
+#ifdef __vita__
+    {
+        uintptr_t resource_base = 0;
+        size_t resource_size = 0;
+        uint32_t file_id = 0xFFFFFFFFu;
+        const char* resource_path = nullptr;
+        const uint32_t dest_start = v_dest_end - n_vertices;
+        const bool described =
+            portRelocDescribePointer(vertices, &resource_base, &resource_size, &file_id, &resource_path);
+        VitaFighterGeomStats* stats = described ? VitaFighterGeomStatsForFile(file_id) : nullptr;
+
+        for (uint32_t i = 0; i < n_vertices && (dest_start + i) < (MAX_VERTICES + 4); ++i) {
+            sVitaFighterVertexSource[dest_start + i] = described ? file_id : 0xFFFFFFFFu;
+        }
+
+        if (stats != nullptr) {
+            stats->vtx_cmds++;
+            stats->vertices_loaded += n_vertices;
+
+            if (stats->vtx_trace_lines < 24u && n_vertices > 0) {
+                const F3DVtx_t* first = &vertices[0].v;
+                const F3DVtx_t* last = &vertices[n_vertices - 1].v;
+                stats->vtx_trace_lines++;
+                port_log("SSB64: FIGHTER_GEOM_VTX file=%u path=%s off=0x%lx n=%u dest=%u "
+                         "first_ob=(%d,%d,%d) first_tc=(%d,%d) first_cn=(%u,%u,%u,%u) "
+                         "last_ob=(%d,%d,%d) last_tc=(%d,%d)\n",
+                         file_id, resource_path != nullptr ? resource_path : "(none)",
+                         (unsigned long)((uintptr_t)vertices - resource_base), n_vertices, dest_start,
+                         first->ob[0], first->ob[1], first->ob[2], first->tc[0], first->tc[1],
+                         first->cn[0], first->cn[1], first->cn[2], first->cn[3],
+                         last->ob[0], last->ob[1], last->ob[2], last->tc[0], last->tc[1]);
+            }
+        }
+    }
+#endif
 
     gfx->GfxSpVertex(n_vertices, v_dest_end - n_vertices, vertices);
 
