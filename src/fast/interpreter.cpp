@@ -172,9 +172,24 @@ static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fil
     const uint8_t* raw = reinterpret_cast<const uint8_t*>(fileBase + offset);
     const size_t maxCommands = std::min<size_t>(available / PORT_PACKED_GFX_SIZE, 256);
 
+    // An all-zero packed command is G_SPNOOP, but a branch target beginning
+    // with eight zero bytes is not a useful resource display-list entry point.
+    // In SSB64 this distinction matters: MVCommon offset 0 is PAD(8) followed
+    // by palette data.  The older heuristic scanned through that data until a
+    // byte pattern happened to look like ENDDL and incorrectly stole a live
+    // runtime segment-0x0E material branch.
+    {
+        const uint32_t* first = reinterpret_cast<const uint32_t*>(raw);
+        if (first[0] == 0 && first[1] == 0) {
+            return false;
+        }
+    }
+
+    bool sawMeaningfulCommand = false;
     for (size_t i = 0; i < maxCommands; ++i) {
         const uint32_t* words = reinterpret_cast<const uint32_t*>(raw + i * PORT_PACKED_GFX_SIZE);
         const uint32_t w0 = words[0];
+        const uint32_t w1 = words[1];
         const uint8_t opcode = static_cast<uint8_t>(w0 >> 24);
 
         // F3DEX2 resource DL opcodes occupy 0x00..0x0F and 0xD7..0xFF.
@@ -183,15 +198,19 @@ static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fil
             return false;
         }
 
+        if (w0 != 0 || w1 != 0) {
+            sawMeaningfulCommand = true;
+        }
+
         if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_ENDDL)) {
-            return true;
+            return sawMeaningfulCommand;
         }
 
         if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_DL)) {
             const bool noPush = ((w0 >> 16) & 1u) != 0;
             if (noPush) {
                 // gSPBranchList is a valid terminal even without G_ENDDL.
-                return true;
+                return sawMeaningfulCommand;
             }
         }
     }
@@ -540,9 +559,11 @@ static VitaFast3DStats sVitaFast3DStats = {};
 
 /* v12 targeted fighter-geometry diagnostics.
  * File IDs are stable entries from the generated SSB64 reloc manifest:
+ *   108 ExternDataBank108 (Kongo Jungle stage geometry)
  *   296 MarioModel
  *   313 FoxModel
  * This is observation-only: it never changes clip/cull/shader decisions. */
+static constexpr uint32_t kVitaKongoStageFileId = 108u;
 static constexpr uint32_t kVitaMarioModelFileId = 296u;
 static constexpr uint32_t kVitaFoxModelFileId = 313u;
 static uint32_t sVitaFighterVertexSource[MAX_VERTICES + 4] = {};
@@ -564,10 +585,14 @@ struct VitaFighterGeomStats {
     uint64_t last_summary_bucket;
 };
 
+static VitaFighterGeomStats sVitaKongoGeomStats = { kVitaKongoStageFileId };
 static VitaFighterGeomStats sVitaMarioGeomStats = { kVitaMarioModelFileId };
 static VitaFighterGeomStats sVitaFoxGeomStats = { kVitaFoxModelFileId };
 
 static VitaFighterGeomStats* VitaFighterGeomStatsForFile(uint32_t file_id) {
+    if (file_id == kVitaKongoStageFileId) {
+        return &sVitaKongoGeomStats;
+    }
     if (file_id == kVitaMarioModelFileId) {
         return &sVitaMarioGeomStats;
     }
@@ -631,7 +656,7 @@ static VitaFighterGeomStats* VitaFighterGeomTriStats(uint8_t a, uint8_t b, uint8
 
 static void VitaFighterGeomTraceReject(VitaFighterGeomStats* stats, const char* reason,
                                        uint8_t i1, uint8_t i2, uint8_t i3,
-                                       const LoadedVertex* v1, const LoadedVertex* v2, const LoadedVertex* v3,
+                                       const Fast::LoadedVertex* v1, const Fast::LoadedVertex* v2, const Fast::LoadedVertex* v3,
                                        uint32_t geometry_mode) {
     if (stats == nullptr || stats->reject_trace_lines >= 24u) {
         return;
@@ -3593,6 +3618,61 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    // PORT: centralise lazy Vtx byte-order normalisation here rather than in a
+    // single microcode opcode handler. Every geometry path (F3D/F3DEX/F3DEX2
+    // and custom/OTR vertex commands) eventually enters GfxSpVertex, so this
+    // guarantees that reloc-backed Vtx data is fixed before any field is read.
+    // portRelocFixupVertexAtRuntime is per-Vtx idempotent and a no-op for
+    // runtime/host-built arrays outside reloc blobs.
+    if (vertices == nullptr || n_vertices == 0) {
+        return;
+    }
+
+    if (dest_index >= MAX_VERTICES || n_vertices > (MAX_VERTICES - dest_index)) {
+#ifdef __vita__
+        static unsigned int sVitaVertexBoundsRejects = 0;
+        if (sVitaVertexBoundsRejects < 32u) {
+            port_log("SSB64: VTX_COMMON_REJECT reason=cache-bounds src=%p n=%lu dest=%lu max=%u count=%u\n",
+                     vertices, (unsigned long)n_vertices, (unsigned long)dest_index,
+                     (unsigned int)MAX_VERTICES, sVitaVertexBoundsRejects);
+        }
+        ++sVitaVertexBoundsRejects;
+#endif
+        return;
+    }
+
+    portRelocFixupVertexAtRuntime((const void*)vertices, (unsigned int)n_vertices);
+
+#ifdef __vita__
+    {
+        static bool sLoggedCommonVertexFixup = false;
+        static unsigned int sVitaCommonVertexTrace = 0;
+        if (!sLoggedCommonVertexFixup) {
+            sLoggedCommonVertexFixup = true;
+            port_log("SSB64: VTX_COMMON_FIXUP active max_vertices=%u\n", (unsigned int)MAX_VERTICES);
+        }
+
+        uintptr_t resource_base = 0;
+        size_t resource_size = 0;
+        uint32_t file_id = 0xFFFFFFFFu;
+        const char* resource_path = nullptr;
+        if (sVitaCommonVertexTrace < 64u &&
+            portRelocDescribePointer(vertices, &resource_base, &resource_size, &file_id, &resource_path)) {
+            // Prioritise the known broken DK/Kongo Jungle geometry and fighter model files,
+            // but keep a small generic trace budget so other broken 3D resources surface too.
+            if (file_id == 108u || file_id == 296u || file_id == 313u || sVitaCommonVertexTrace < 16u) {
+                const F3DVtx_t* first = &vertices[0].v;
+                port_log("SSB64: VTX_COMMON_FIXUP file=%u path=%s off=0x%lx n=%lu dest=%lu first_ob=(%d,%d,%d) first_tc=(%d,%d)\n",
+                         file_id, resource_path != nullptr ? resource_path : "(none)",
+                         (unsigned long)((uintptr_t)vertices - resource_base),
+                         (unsigned long)n_vertices, (unsigned long)dest_index,
+                         first->ob[0], first->ob[1], first->ob[2], first->tc[0], first->tc[1]);
+                ++sVitaCommonVertexTrace;
+            }
+        }
+    }
+#endif
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -6399,10 +6479,6 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
                      (uintptr_t)vertices, n_vertices, v_dest_end, (uintptr_t)cmd->words.w1);
         return false;
     }
-
-    // Lazy vertex byte-order fixup (port-side, Option A).
-    // Per-vertex idempotency handles overlapping sub-region reloads.
-    portRelocFixupVertexAtRuntime((const void*)vertices, n_vertices);
 
 #ifdef __vita__
     {
