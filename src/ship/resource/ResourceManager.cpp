@@ -9,9 +9,14 @@
 #include "ship/config/ConsoleVariable.h"
 #include "ship/Context.h"
 
+#if defined(__vita__) || defined(SSB64_VITA_BUILD)
+#define SHIP_RESOURCE_VITA_BUILD 1
+extern "C" void port_log(const char* fmt, ...);
+#endif
+
 namespace Ship {
 
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
 /* Real-hardware Vita testing traced a deterministic crash - always at the
  * very first resource load, always the same kernel object UID, no ASLR on
  * this platform to make it look different run to run - to pte_osMutexLock
@@ -85,7 +90,7 @@ void ResourceManager::Init(const std::vector<std::string>& archivePaths,
     mArchiveManager = std::make_shared<ArchiveManager>();
     GetArchiveManager()->Init(archivePaths, validHashes);
 
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
     // Real-hardware testing this session repeatedly showed the main thread
     // parked in a generic kernel wait (at a point that moved around between
     // runs) while this pool's own worker thread(s) sat "Running" in a
@@ -222,7 +227,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     cachedResource = GetCachedResource(identifier, true);
 
     {
-#ifndef __vita__
+#ifndef SHIP_RESOURCE_VITA_BUILD
         const std::lock_guard<std::mutex> lock(mMutex);
 #endif
 
@@ -269,13 +274,13 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         auto promise = std::make_shared<std::promise<std::shared_ptr<IResource>>>();
         promise->set_value(cacheCheck);
         auto future = promise->get_future().share();
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
         sVitaLeakedResourcePromises.push_back(promise);
 #endif
         return future;
     }
 
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
     // Rinnegatamante (author of the Vita-patched rendering layer this port's
     // libultraship fork is merged from) removed ResourceManager's thread
     // pool entirely as one of several Vita-specific optimizations. This
@@ -309,7 +314,24 @@ ResourceManager::LoadResourceAsync(const std::string& filePath, bool loadExact, 
 
 std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifier& identifier, bool loadExact,
                                                          std::shared_ptr<ResourceInitData> initData) {
+#ifdef SHIP_RESOURCE_VITA_BUILD
+    /*
+     * Vita callers of LoadResource() are synchronous already.  Routing them
+     * through LoadResourceAsync() creates a std::promise/shared_future shared
+     * state (mutex + condition variable) for every reloc load.  Real-hardware
+     * core dumps repeatedly show _State_baseV2::_M_do_set immediately above
+     * portRelocLoadFileFromBytes.  Execute the actual load directly so the
+     * reloc hot path never enters std::future machinery.
+     */
+    static bool sLoggedVitaDirectLoad = false;
+    if (!sLoggedVitaDirectLoad) {
+        sLoggedVitaDirectLoad = true;
+        port_log("SSB64: VITA_RESOURCE_MODE sync-direct LoadResourceProcess (no std::future on sync path)\n");
+    }
+    auto resource = LoadResourceProcess(identifier, loadExact, initData);
+#else
     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+#endif
     if (resource == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
     }
@@ -345,7 +367,7 @@ ResourceManager::CheckCache(const ResourceIdentifier& identifier, bool loadExact
         }
     }
 
-#ifndef __vita__
+#ifndef SHIP_RESOURCE_VITA_BUILD
     const std::lock_guard<std::mutex> lock(mMutex);
 #endif
 
@@ -413,7 +435,7 @@ ResourceManager::LoadResourcesProcess(const ResourceFilter& filter) {
 
 std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
 ResourceManager::LoadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
     // See LoadResourceAsync's comment above - no thread pool on Vita.
     auto promise = std::make_shared<std::promise<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>>();
     promise->set_value(LoadResourcesProcess(filter));
@@ -439,7 +461,11 @@ std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadRe
 }
 
 std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadResources(const ResourceFilter& filter) {
+#ifdef SHIP_RESOURCE_VITA_BUILD
+    return LoadResourcesProcess(filter);
+#else
     return LoadResourcesAsync(filter, BS::pr::highest).get();
+#endif
 }
 
 void ResourceManager::DirtyResources(const ResourceFilter& filter) {
@@ -456,7 +482,7 @@ void ResourceManager::DirtyResources(const ResourceFilter& filter) {
             }
         }
     };
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
     // See LoadResourceAsync's comment above - no thread pool on Vita.
     doDirty();
 #else
@@ -473,7 +499,7 @@ void ResourceManager::UnloadResourcesAsync(const std::string& searchMask, BS::pr
 }
 
 void ResourceManager::UnloadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
-#ifdef __vita__
+#ifdef SHIP_RESOURCE_VITA_BUILD
     // See LoadResourceAsync's comment above - no thread pool on Vita.
     UnloadResourcesProcess(filter);
 #else
@@ -513,7 +539,7 @@ size_t ResourceManager::UnloadResource(const ResourceIdentifier& identifier) {
     size_t ret = 0;
     // We can only erase the resource if we have any resources for that owner.
     if (mResourceCache.contains(identifier)) {
-#ifndef __vita__
+#ifndef SHIP_RESOURCE_VITA_BUILD
         const std::lock_guard<std::mutex> lock(mMutex);
 #endif
         mResourceCache.erase(identifier);

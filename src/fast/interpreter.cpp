@@ -1156,6 +1156,29 @@ static void VitaApplySafeAreaCropToCanvas(XYWidthHeight* rect, int32_t canvas_x,
     rect->height = cropped_h;
 }
 
+/*
+ * Stage wallpapers are emitted as a stack of TextureRectangle strips.  Their
+ * X span covers the canonical 10..310 safe area, but the SObj path may have
+ * installed a local scissor by the time each strip reaches GfxDrawRectangle.
+ * In that case sVitaDefaultSafeAreaScissorActive is false even though the
+ * rectangle itself is authored to fill the N64 visible area, producing the
+ * inset/black-background regression.
+ *
+ * Detect the semantic shape from the original U10.2 rectangle coordinates:
+ * it must cover both safe-area edges and be approximately 300 N64 pixels wide.
+ * Small UI/text rectangles (Mario name, HUD, labels) can never match this.
+ */
+static bool VitaTextureRectCoversSafeAreaWidth(int32_t ulx, int32_t lrx) {
+    const int32_t safe_left_q = 10 * 4;
+    const int32_t safe_right_q = 310 * 4;
+    const int32_t tolerance_q = 8; /* two N64 pixels */
+    const int32_t width_q = lrx - ulx;
+
+    return (width_q >= (296 * 4)) &&
+           (ulx <= (safe_left_q + tolerance_q)) &&
+           (lrx >= (safe_right_q - tolerance_q));
+}
+
 // TRACK A round 2 (2026-08-21): the earlier "first 20 IA textures anywhere"
 // backend trace fired entirely on unrelated sprites before scene 30 ever
 // loaded (budget exhausted). Replaced with an explicit arm/correlate
@@ -1384,10 +1407,31 @@ static void WalkCastleDLFingerprint(F3DGfx* dl, VitaCastleDLFingerprint* fp, int
         fp->truncated = true;
         return;
     }
+
+    /* This is diagnostic-only code and must never make rendering less stable.
+     * Fingerprint only display-list commands that live inside a registered
+     * reloc resource.  Runtime-built/segmented lists (notably segment 0x0E in
+     * OpeningMario and some MObj paths) are intentionally left to the live
+     * interpreter capture instead of being dereferenced speculatively here. */
+    uintptr_t resource_base = 0;
+    size_t resource_size = 0;
+    uint32_t resource_file_id = 0;
+    if (!portRelocDescribePointer(dl, &resource_base, &resource_size, &resource_file_id, nullptr) ||
+        resource_size < sizeof(F3DGfx)) {
+        fp->truncated = true;
+        return;
+    }
+    const uintptr_t resource_end = resource_base + resource_size;
+
     if (depth > (int)fp->max_depth_hit) {
         fp->max_depth_hit = (uint32_t)depth;
     }
     for (;;) {
+        const uintptr_t dl_addr = (uintptr_t)dl;
+        if (dl_addr < resource_base || dl_addr > resource_end - sizeof(F3DGfx)) {
+            fp->truncated = true;
+            return;
+        }
         if (fp->recursive_command_count >= kMaxVisited) {
             fp->truncated = true;
             return;
@@ -1406,8 +1450,18 @@ static void WalkCastleDLFingerprint(F3DGfx* dl, VitaCastleDLFingerprint* fp, int
             fp->nested_dl_count++;
             bool nopush = ((dl->words.w0 >> 16) & 1) != 0;
             F3DGfx* sub = (F3DGfx*)gfx->SegAddr(dl->words.w1);
-            if (sub != nullptr) {
+
+            uintptr_t sub_base = 0;
+            size_t sub_size = 0;
+            uint32_t sub_file_id = 0;
+            if (sub != nullptr &&
+                portRelocDescribePointer(sub, &sub_base, &sub_size, &sub_file_id, nullptr) &&
+                sub_size >= sizeof(F3DGfx)) {
                 WalkCastleDLFingerprint(sub, fp, depth + 1);
+            } else {
+                /* A valid runtime-built sub-DL is not an error; it simply
+                 * cannot be safely fingerprinted by this reloc-only walker. */
+                fp->truncated = true;
             }
             if (nopush) {
                 return; /* branch: control transferred, this level ends */
@@ -5175,6 +5229,9 @@ void Interpreter::GfxDpSetFillColor(uint32_t packed_color) {
 }
 
 void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
+#ifdef __vita__
+    const bool vitaSafeAreaTextureRect = !mFbActive && VitaTextureRectCoversSafeAreaWidth(ulx, lrx);
+#endif
     uint32_t saved_other_mode_h = mRdp->other_mode_h;
     uint32_t cycle_type = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
 
@@ -5249,7 +5306,7 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 
     AdjustVIewportOrScissor(&default_viewport);
 #ifdef __vita__
-    if (!mFbActive && sVitaDefaultSafeAreaScissorActive) {
+    if (!mFbActive && (sVitaDefaultSafeAreaScissorActive || vitaSafeAreaTextureRect)) {
         const int32_t canvas_y = (int32_t)mGfxCurrentWindowDimensions.height -
                                  ((int32_t)mGameWindowViewport.y + (int32_t)mGameWindowViewport.height);
         VitaApplySafeAreaCropToCanvas(&default_viewport, mGameWindowViewport.x, canvas_y,
@@ -8056,6 +8113,17 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
 #endif
 
     Flush();
+
+    // Direct-to-swapchain paths (notably Vita's direct-fb0 path) bypass
+    // ComposeFinalFrame(), so they must not carry a redirect-active
+    // glColorMask(false) across the presentation/frame boundary.  Keep the
+    // backend and Fast3D cache synchronized just like ComposeFinalFrame() and
+    // PresentCurrentFramebuffer() already do.
+    if (!mRenderingState.color_write_enabled) {
+        mRapi->SetColorWriteMask(true);
+        mRenderingState.color_write_enabled = true;
+    }
+
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 

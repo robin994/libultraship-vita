@@ -1606,14 +1606,97 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
         mLastScissorEnabled = 0;
         glDisable(GL_SCISSOR_TEST);
     }
+
+    // glClear obeys the GL color/depth write masks.  Redirect-to-Z emulation
+    // can legitimately leave color writes disabled at this point, so make a
+    // requested color clear unconditional and restore the emulated state
+    // afterwards.
+    const bool restoreColorMask = color && !mCurrentColorWriteMask;
+    if (restoreColorMask) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+    if (restoreColorMask) {
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    }
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
         glEnable(GL_SCISSOR_TEST);
     }
+}
+
+void GfxRenderingAPIOGL::SetColorWriteMask(bool enable) {
+#ifdef __vita__
+    static bool sVitaColorMaskHookLogged = false;
+    if (!sVitaColorMaskHookLogged) {
+        sVitaColorMaskHookLogged = true;
+        port_log("SSB64: VITA_OGL_REDIRECT color-write-mask hook active\n");
+    }
+#endif
+    glColorMask(enable ? GL_TRUE : GL_FALSE,
+                enable ? GL_TRUE : GL_FALSE,
+                enable ? GL_TRUE : GL_FALSE,
+                enable ? GL_TRUE : GL_FALSE);
+    mCurrentColorWriteMask = enable;
+}
+
+void GfxRenderingAPIOGL::ClearColorRegion(float x0, float y0, float x1, float y1) {
+#ifdef __vita__
+    static bool sVitaRegionalClearHookLogged = false;
+    if (!sVitaRegionalClearHookLogged) {
+        sVitaRegionalClearHookLogged = true;
+        port_log("SSB64: VITA_OGL_REDIRECT regional-color-clear hook active\n");
+    }
+#endif
+    if (mCurrentFrameBuffer >= mFrameBuffers.size()) {
+        return;
+    }
+
+    FramebufferOGL& fb = mFrameBuffers[mCurrentFrameBuffer];
+    if ((fb.width == 0) || (fb.height == 0)) {
+        return;
+    }
+
+    if (x0 < 0.0f) x0 = 0.0f;
+    if (y0 < 0.0f) y0 = 0.0f;
+    if (x1 > 1.0f) x1 = 1.0f;
+    if (y1 > 1.0f) y1 = 1.0f;
+    if ((x1 <= x0) || (y1 <= y0)) {
+        return;
+    }
+
+    const GLint sx0 = (GLint)(x0 * (float)fb.width);
+    const GLint sy0 = (GLint)(y0 * (float)fb.height);
+    GLint sx1 = (GLint)(x1 * (float)fb.width + 0.9999f);
+    GLint sy1 = (GLint)(y1 * (float)fb.height + 0.9999f);
+    if (sx1 > (GLint)fb.width) sx1 = (GLint)fb.width;
+    if (sy1 > (GLint)fb.height) sy1 = (GLint)fb.height;
+
+    GLint prevScissor[4];
+    GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    glGetIntegerv(GL_SCISSOR_BOX, prevScissor);
+
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(sx0, sy0, sx1 - sx0, sy1 - sy0);
+
+    const bool restoreColorMask = !mCurrentColorWriteMask;
+    if (restoreColorMask) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (restoreColorMask) {
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    }
+
+    glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
+    if (!scissorWasEnabled) {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    mLastScissorEnabled = scissorWasEnabled ? 1 : 0;
 }
 
 void GfxRenderingAPIOGL::ClearDepthRegion(int x, int y, int w, int h) {
