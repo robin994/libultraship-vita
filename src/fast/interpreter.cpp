@@ -65,6 +65,8 @@ extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base
 extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
                                          uint32_t* out_file_id, const char** out_path);
 extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
+extern "C" int portRelocDecodeVerticesForRuntime(const void *addr, unsigned int num_vtx,
+                                                     void *out_vertices, size_t out_size);
 extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int num_bytes);
 
 /* Game-specific DL safety hooks. The embedding game (e.g. SSB64) registers
@@ -563,9 +565,11 @@ static VitaFast3DStats sVitaFast3DStats = {};
  *   296 MarioModel
  *   313 FoxModel
  * This is observation-only: it never changes clip/cull/shader decisions. */
+static constexpr uint32_t kVitaCastleStageFileId = 106u;
 static constexpr uint32_t kVitaKongoStageFileId = 108u;
 static constexpr uint32_t kVitaMarioModelFileId = 296u;
 static constexpr uint32_t kVitaFoxModelFileId = 313u;
+static constexpr uint32_t kVitaDonkeyModelFileId = 317u;
 static uint32_t sVitaFighterVertexSource[MAX_VERTICES + 4] = {};
 
 struct VitaFighterGeomStats {
@@ -585,11 +589,16 @@ struct VitaFighterGeomStats {
     uint64_t last_summary_bucket;
 };
 
+static VitaFighterGeomStats sVitaCastleGeomStats = { kVitaCastleStageFileId };
 static VitaFighterGeomStats sVitaKongoGeomStats = { kVitaKongoStageFileId };
 static VitaFighterGeomStats sVitaMarioGeomStats = { kVitaMarioModelFileId };
 static VitaFighterGeomStats sVitaFoxGeomStats = { kVitaFoxModelFileId };
+static VitaFighterGeomStats sVitaDonkeyGeomStats = { kVitaDonkeyModelFileId };
 
 static VitaFighterGeomStats* VitaFighterGeomStatsForFile(uint32_t file_id) {
+    if (file_id == kVitaCastleStageFileId) {
+        return &sVitaCastleGeomStats;
+    }
     if (file_id == kVitaKongoStageFileId) {
         return &sVitaKongoGeomStats;
     }
@@ -598,6 +607,9 @@ static VitaFighterGeomStats* VitaFighterGeomStatsForFile(uint32_t file_id) {
     }
     if (file_id == kVitaFoxModelFileId) {
         return &sVitaFoxGeomStats;
+    }
+    if (file_id == kVitaDonkeyModelFileId) {
+        return &sVitaDonkeyGeomStats;
     }
     return nullptr;
 }
@@ -3618,12 +3630,9 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
-    // PORT: centralise lazy Vtx byte-order normalisation here rather than in a
-    // single microcode opcode handler. Every geometry path (F3D/F3DEX/F3DEX2
-    // and custom/OTR vertex commands) eventually enters GfxSpVertex, so this
-    // guarantees that reloc-backed Vtx data is fixed before any field is read.
-    // portRelocFixupVertexAtRuntime is per-Vtx idempotent and a no-op for
-    // runtime/host-built arrays outside reloc blobs.
+    // PORT: centralise Vtx byte-order normalisation here rather than in reloc
+    // chain heuristics. On Vita, reloc-backed vertices are decoded into a
+    // temporary host-order copy so the source blob is never mutated.
     if (vertices == nullptr || n_vertices == 0) {
         return;
     }
@@ -3641,7 +3650,29 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         return;
     }
 
+    const F3DVtx* vertex_source = vertices;
+#ifdef __vita__
+    F3DVtx decoded_vertices[MAX_VERTICES];
+    const int decode_result = portRelocDecodeVerticesForRuntime(
+        (const void*)vertices, (unsigned int)n_vertices, decoded_vertices, sizeof(decoded_vertices));
+    if (decode_result < 0) {
+        static unsigned int sVitaVertexDecodeRejects = 0;
+        if (sVitaVertexDecodeRejects < 32u) {
+            port_log("SSB64: VTX_COMMON_REJECT reason=decode-failed src=%p n=%lu dest=%lu count=%u\n",
+                     vertices, (unsigned long)n_vertices, (unsigned long)dest_index,
+                     sVitaVertexDecodeRejects);
+        }
+        ++sVitaVertexDecodeRejects;
+        return;
+    }
+    if (decode_result > 0) {
+        vertex_source = decoded_vertices;
+    }
+#else
+    // Desktop/non-Vita keeps the legacy in-place idempotent path because its
+    // reloc pass2 may already have normalized some vertex ranges.
     portRelocFixupVertexAtRuntime((const void*)vertices, (unsigned int)n_vertices);
+#endif
 
 #ifdef __vita__
     {
@@ -3660,8 +3691,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             portRelocDescribePointer(vertices, &resource_base, &resource_size, &file_id, &resource_path)) {
             // Prioritise the known broken DK/Kongo Jungle geometry and fighter model files,
             // but keep a small generic trace budget so other broken 3D resources surface too.
-            if (file_id == 108u || file_id == 296u || file_id == 313u || sVitaCommonVertexTrace < 16u) {
-                const F3DVtx_t* first = &vertices[0].v;
+            if (file_id == 106u || file_id == 108u || file_id == 296u || file_id == 313u || file_id == 317u || sVitaCommonVertexTrace < 16u) {
+                const F3DVtx_t* first = &vertex_source[0].v;
                 port_log("SSB64: VTX_COMMON_FIXUP file=%u path=%s off=0x%lx n=%lu dest=%lu first_ob=(%d,%d,%d) first_tc=(%d,%d)\n",
                          file_id, resource_path != nullptr ? resource_path : "(none)",
                          (unsigned long)((uintptr_t)vertices - resource_base),
@@ -3674,8 +3705,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 #endif
 
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
-        const F3DVtx_t* v = &vertices[i].v;
-        const F3DVtx_tn* vn = &vertices[i].n;
+        const F3DVtx_t* v = &vertex_source[i].v;
+        const F3DVtx_tn* vn = &vertex_source[i].n;
         struct LoadedVertex* d = &mRsp->loaded_vertices[dest_index];
 
         if (v == nullptr) {

@@ -36,6 +36,13 @@ extern "C" void portRelocFixupVertexAtRuntime(const void* /*addr*/,
                                               unsigned int /*num_vtx*/) {
 }
 
+extern "C" int portRelocDecodeVerticesForRuntime(const void* /*addr*/,
+                                                   unsigned int /*num_vtx*/,
+                                                   void* /*out_vertices*/,
+                                                   std::size_t /*out_size*/) {
+    return 0;
+}
+
 extern "C" void portRelocFixupTextureAtRuntime(const void* /*addr*/,
                                                unsigned int /*num_bytes*/) {
 }
