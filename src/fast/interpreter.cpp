@@ -6657,18 +6657,38 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
         size_t callerIndex = 0;
         if (portFindNormalizedDisplayListCommand(cmd, &callerInfo, &callerIndex) && callerInfo != nullptr) {
             const uint32_t offset = static_cast<uint32_t>(cmd->words.w1 & 0x00FFFFFFu);
-            if (portPackedDisplayListTargetLooksValid(callerInfo->fileBase, callerInfo->fileSize, offset)) {
+
+            uintptr_t resourceBase = 0;
+            size_t resourceSize = 0;
+            uint32_t fileId = 0xFFFFFFFFu;
+            const char* resourcePath = nullptr;
+            portRelocDescribePointer(callerInfo->source, &resourceBase, &resourceSize, &fileId, &resourcePath);
+
+            // MVCommon begins with palettes/raw data; its first real Gfx array
+            // is dMVCommon_DL_0x5A18. The generic bounded opcode heuristic can
+            // accidentally find an ENDDL-looking byte pattern in those palette
+            // bytes (the clean v17 hardware log repeatedly misclassified +0x8).
+            // This range is known from relocData/52_MVCommon.c, so do not allow
+            // segment-E branches into it to steal the live runtime material DL.
+            const bool knownNonDlPrefix = (fileId == 52u && offset < 0x5A18u);
+            if (knownNonDlPrefix) {
+#ifdef __vita__
+                static unsigned int sSeg0EKnownDataRejectBudget = 16;
+                if (sSeg0EKnownDataRejectBudget > 0) {
+                    --sSeg0EKnownDataRejectBudget;
+                    port_log("SSB64: SEG0E_GDL_REJECT reason=known-data-prefix file=%u path=%s caller_idx=%u off=0x%x runtime_base=%p\n",
+                             fileId, resourcePath != nullptr ? resourcePath : "(unknown)",
+                             (unsigned int)callerIndex, offset,
+                             reinterpret_cast<void*>(gfx->mSegmentPointers[0x0E]));
+                }
+#endif
+            } else if (portPackedDisplayListTargetLooksValid(callerInfo->fileBase, callerInfo->fileSize, offset)) {
                 subGFX = reinterpret_cast<F3DGfx*>(callerInfo->fileBase + offset);
                 portSeg0EInFileResolved = true;
 #ifdef __vita__
                 static unsigned int sSeg0EInFileLogBudget = 32;
                 if (sSeg0EInFileLogBudget > 0) {
                     --sSeg0EInFileLogBudget;
-                    uintptr_t resourceBase = 0;
-                    size_t resourceSize = 0;
-                    uint32_t fileId = 0xFFFFFFFFu;
-                    const char* resourcePath = nullptr;
-                    portRelocDescribePointer(callerInfo->source, &resourceBase, &resourceSize, &fileId, &resourcePath);
                     port_log("SSB64: SEG0E_GDL_RESOLVE mode=in-file file=%u path=%s caller_idx=%u off=0x%x target=%p runtime_base=%p\n",
                              fileId, resourcePath != nullptr ? resourcePath : "(unknown)",
                              (unsigned int)callerIndex, offset, subGFX,
