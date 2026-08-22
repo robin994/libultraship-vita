@@ -152,6 +152,55 @@ bool portFindNormalizedDisplayListCommand(const Fast::F3DGfx* cmd, const PortPac
     return false;
 }
 
+// A segment-0x0E G_DL in a packed reloc resource is ambiguous on the port:
+// some commands branch to another packed DL in the same file, while fighter
+// material setup can deliberately point segment 0x0E at a runtime-built native
+// Gfx buffer.  Do not decide purely from whether segment 0x0E is currently set.
+// Validate the in-file candidate first.  This also avoids the historical
+// regression where an unrelated/stale runtime segment-E base stole an
+// intra-file model branch and produced partial geometry.
+static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fileSize, uint32_t offset) {
+    if (fileBase == 0 || offset >= fileSize || (offset & (PORT_PACKED_GFX_SIZE - 1)) != 0) {
+        return false;
+    }
+
+    const size_t available = fileSize - offset;
+    if (available < PORT_PACKED_GFX_SIZE) {
+        return false;
+    }
+
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(fileBase + offset);
+    const size_t maxCommands = std::min<size_t>(available / PORT_PACKED_GFX_SIZE, 256);
+
+    for (size_t i = 0; i < maxCommands; ++i) {
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(raw + i * PORT_PACKED_GFX_SIZE);
+        const uint32_t w0 = words[0];
+        const uint8_t opcode = static_cast<uint8_t>(w0 >> 24);
+
+        // F3DEX2 resource DL opcodes occupy 0x00..0x0F and 0xD7..0xFF.
+        // The same validity rule is used by portNormalizeDisplayListPointer.
+        if (opcode > 0x0F && opcode < 0xD7) {
+            return false;
+        }
+
+        if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_ENDDL)) {
+            return true;
+        }
+
+        if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_DL)) {
+            const bool noPush = ((w0 >> 16) & 1u) != 0;
+            if (noPush) {
+                // gSPBranchList is a valid terminal even without G_ENDDL.
+                return true;
+            }
+        }
+    }
+
+    // A genuine resource sub-DL should terminate (ENDDL or branch) within the
+    // bounded scan.  Refuse to classify arbitrary texture/vertex bytes as DL.
+    return false;
+}
+
 Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
     uintptr_t fileBase = 0;
     size_t fileSize = 0;
@@ -6517,6 +6566,43 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
 
+    // PORT: Resolve ambiguous segment-0x0E G_DL commands using the resource
+    // context of the *normalized* caller command.  cmd usually points into a
+    // widened vector, so portRelocFindContainingFile(cmd) cannot recover the
+    // originating file.  The packed-DL cache can.
+    //
+    // Prefer a demonstrably-valid intra-file packed DL.  Only use the runtime
+    // segment-E material buffer when the same-file candidate is not a valid DL.
+    // This preserves legitimate per-MObj runtime sub-DLs while preventing a
+    // populated segment E from hijacking model/stage branches.
+    bool portSeg0EInFileResolved = false;
+    if (cmd->words.w1 <= UINT32_MAX && ((cmd->words.w1 >> 24) & 0xFFu) == 0x0Eu) {
+        const PortPackedDisplayListInfo* callerInfo = nullptr;
+        size_t callerIndex = 0;
+        if (portFindNormalizedDisplayListCommand(cmd, &callerInfo, &callerIndex) && callerInfo != nullptr) {
+            const uint32_t offset = static_cast<uint32_t>(cmd->words.w1 & 0x00FFFFFFu);
+            if (portPackedDisplayListTargetLooksValid(callerInfo->fileBase, callerInfo->fileSize, offset)) {
+                subGFX = reinterpret_cast<F3DGfx*>(callerInfo->fileBase + offset);
+                portSeg0EInFileResolved = true;
+#ifdef __vita__
+                static unsigned int sSeg0EInFileLogBudget = 32;
+                if (sSeg0EInFileLogBudget > 0) {
+                    --sSeg0EInFileLogBudget;
+                    uintptr_t resourceBase = 0;
+                    size_t resourceSize = 0;
+                    uint32_t fileId = 0xFFFFFFFFu;
+                    const char* resourcePath = nullptr;
+                    portRelocDescribePointer(callerInfo->source, &resourceBase, &resourceSize, &fileId, &resourcePath);
+                    port_log("SSB64: SEG0E_GDL_RESOLVE mode=in-file file=%u path=%s caller_idx=%u off=0x%x target=%p runtime_base=%p\n",
+                             fileId, resourcePath != nullptr ? resourcePath : "(unknown)",
+                             (unsigned int)callerIndex, offset, subGFX,
+                             reinterpret_cast<void*>(gfx->mSegmentPointers[0x0E]));
+                }
+#endif
+            }
+        }
+    }
+
     // PORT FIX: stride correction for runtime segment 0x0E DLs.
     //
     // SSB64 builds per-MObj material setup sub-DLs in the graphics heap and
@@ -6543,7 +6629,7 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
         // addresses; applying this rewrite to a 64-bit pointer redirects the
         // call into unrelated segment-E heap data and starts a runaway walk.
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
-        if (cmd->words.w1 <= UINT32_MAX && segByte == 0x0E) {
+        if (!portSeg0EInFileResolved && cmd->words.w1 <= UINT32_MAX && segByte == 0x0E) {
             uint32_t segNum = 0x0E;
             uintptr_t segBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
             if (segBase != 0) {
@@ -6557,27 +6643,42 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                     if ((n64_offset & 7u) == 0u) {
                         uint32_t cmd_index = n64_offset / PORT_PACKED_GFX_SIZE;
                         subGFX = (F3DGfx*)(segBase + cmd_index * sizeof(F3DGfx));
+#ifdef __vita__
+                        static unsigned int sSeg0ERuntimeLogBudget = 32;
+                        if (sSeg0ERuntimeLogBudget > 0) {
+                            --sSeg0ERuntimeLogBudget;
+                            port_log("SSB64: SEG0E_GDL_RESOLVE mode=runtime off=0x%x base=%p target=%p\n",
+                                     n64_offset, reinterpret_cast<void*>(segBase), subGFX);
+                        }
+#endif
                     }
                 }
             }
         }
     }
 
-    // Fallback for packed seg=0x0E G_DL commands left unresolved by
-    // portNormalizeDisplayListPointer.  SegAddr returns the runtime segment
-    // 0x0E base + offset when the game has set it via gsSPSegment(0xE, ...).
-    // If no runtime segment is set, SegAddr returns the raw w1 (a garbage
-    // pointer like 0x0E000000+offset); in that case fall back to the calling
-    // DL's containing reloc file (intra-file sub-DL branch).
+    // Last-resort fallback when segment E is unset and the strict validator
+    // could not classify the target.  Recover the original reloc context from
+    // the widened-command cache; querying cmd itself is wrong because cmd is
+    // normally heap memory owned by the normalized vector.
     {
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
-        if (cmd->words.w1 <= UINT32_MAX && segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
-            uintptr_t fileBase = 0;
-            size_t fileSize = 0;
-            if (portRelocFindContainingFile(cmd, &fileBase, &fileSize)) {
+        if (!portSeg0EInFileResolved && cmd->words.w1 <= UINT32_MAX && segByte == 0x0E &&
+            (uintptr_t)subGFX == cmd->words.w1) {
+            const PortPackedDisplayListInfo* callerInfo = nullptr;
+            size_t callerIndex = 0;
+            if (portFindNormalizedDisplayListCommand(cmd, &callerInfo, &callerIndex) && callerInfo != nullptr) {
                 uint32_t offset = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
-                if (offset < fileSize) {
-                    subGFX = (F3DGfx*)(fileBase + offset);
+                if (offset < callerInfo->fileSize) {
+                    subGFX = (F3DGfx*)(callerInfo->fileBase + offset);
+#ifdef __vita__
+                    static unsigned int sSeg0EFallbackLogBudget = 16;
+                    if (sSeg0EFallbackLogBudget > 0) {
+                        --sSeg0EFallbackLogBudget;
+                        port_log("SSB64: SEG0E_GDL_RESOLVE mode=in-file-fallback caller_idx=%u off=0x%x target=%p\n",
+                                 (unsigned int)callerIndex, offset, subGFX);
+                    }
+#endif
                 }
             }
         }
