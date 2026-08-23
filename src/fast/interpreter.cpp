@@ -3527,8 +3527,14 @@ void Interpreter::MatrixMul(float res[4][4], const float a[4][4], const float b[
 void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
     float light_dir[3] = { light->dir[0] / 127.0f, light->dir[1] / 127.0f, light->dir[2] / 127.0f };
 
-    Interpreter::TransposedMatrixMul(coeffs, light_dir,
-                                     mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+    if (mRsp->modelview_matrix_stack_size > 0) {
+        Interpreter::TransposedMatrixMul(coeffs, light_dir,
+                                         mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+    } else {
+        coeffs[0] = light_dir[0];
+        coeffs[1] = light_dir[1];
+        coeffs[2] = light_dir[2];
+    }
     Interpreter::NormalizeVector(coeffs);
 }
 
@@ -3549,18 +3555,18 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     }
 
 #ifdef __vita__
-    /* v12: RSP matrix-stack invariant. Several hot paths index
-     * modelview_matrix_stack_size - 1 without any independent bounds check.
-     * A single malformed/unbalanced G_POPMTX must therefore never leave the
-     * depth at 0 (underflow) or above the physical 11-entry array. */
-    if (mRsp->modelview_matrix_stack_size == 0 || mRsp->modelview_matrix_stack_size > 11) {
+    /* v13: depth 0 is a legitimate *empty/reset* state in this port's
+     * multi-camera display-list flow. v12 incorrectly forced 1 -> 1 on POP,
+     * which could make a later camera inherit the previous camera's modelview
+     * transform (most visibly the opening-room Master Hand / logo pass).
+     * Keep 0 representable, but never allow an out-of-range positive depth. */
+    if (mRsp->modelview_matrix_stack_size > 11) {
         const unsigned int bad_depth = (unsigned int)mRsp->modelview_matrix_stack_size;
         static unsigned int sMtxDepthRepairBudget = 32;
-        mRsp->modelview_matrix_stack_size = (bad_depth == 0) ? 1 : 11;
+        mRsp->modelview_matrix_stack_size = 11;
         if (sMtxDepthRepairBudget > 0) {
             --sMtxDepthRepairBudget;
-            port_log("SSB64: GFX_MTX_DEPTH_REPAIR context=GfxSpMatrix bad=%u repaired=%u\n",
-                     bad_depth, (unsigned int)mRsp->modelview_matrix_stack_size);
+            port_log("SSB64: GFX_MTX_DEPTH_REPAIR context=GfxSpMatrix bad=%u repaired=11\n", bad_depth);
         }
     }
 #endif
@@ -3603,7 +3609,26 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
         }
     } else { // G_MTX_MODELVIEW
-        if (parameters & mtx_push) {
+        /* Empty-stack compatibility: some SSB64 camera/link sequences pop the
+         * final modelview entry and expect the next matrix command to seed a
+         * fresh camera state. Never memcpy from stack[-1] when PUSH arrives on
+         * an empty stack; seed slot 0 as identity instead. */
+        if (mRsp->modelview_matrix_stack_size == 0) {
+            memset(mRsp->modelview_matrix_stack[0], 0, sizeof(mRsp->modelview_matrix_stack[0]));
+            mRsp->modelview_matrix_stack[0][0][0] = 1.0f;
+            mRsp->modelview_matrix_stack[0][1][1] = 1.0f;
+            mRsp->modelview_matrix_stack[0][2][2] = 1.0f;
+            mRsp->modelview_matrix_stack[0][3][3] = 1.0f;
+            mRsp->modelview_matrix_stack_size = 1;
+#ifdef __vita__
+            static unsigned int sMtxEmptyReseedBudget = 32;
+            if (sMtxEmptyReseedBudget > 0) {
+                --sMtxEmptyReseedBudget;
+                port_log("SSB64: GFX_MTX_EMPTY_RESEED parameters=0x%02X action=identity-base\n",
+                         (unsigned int)parameters);
+            }
+#endif
+        } else if (parameters & mtx_push) {
             if (mRsp->modelview_matrix_stack_size < 11) {
                 ++mRsp->modelview_matrix_stack_size;
                 memcpy(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
@@ -3620,8 +3645,6 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
             }
         }
         if (parameters & mtx_load) {
-            if (mRsp->modelview_matrix_stack_size == 0)
-                ++mRsp->modelview_matrix_stack_size;
             memcpy(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], matrix, sizeof(matrix));
         } else {
             MatrixMul(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], matrix,
@@ -3629,28 +3652,42 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
         }
         mRsp->lights_changed = 1;
     }
-    MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
+    if (mRsp->modelview_matrix_stack_size > 0) {
+        MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
+    } else {
+        /* Identity modelview: MP = P. This keeps projection-only commands safe
+         * while the stack is intentionally empty between camera passes. */
+        memcpy(mRsp->MP_matrix, mRsp->P_matrix, sizeof(mRsp->MP_matrix));
+    }
 }
 
 void Interpreter::GfxSpPopMatrix(uint32_t count) {
     while (count--) {
-        /* The base model-view matrix is slot 0 and is always logically
-         * present. Allowing depth 1 -> 0 makes every subsequent
-         * stack_size-1 access index before modelview_matrix_stack[]. */
-        if (mRsp->modelview_matrix_stack_size > 1) {
+        if (mRsp->modelview_matrix_stack_size > 0) {
             --mRsp->modelview_matrix_stack_size;
-            MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
-                      mRsp->P_matrix);
+            if (mRsp->modelview_matrix_stack_size > 0) {
+                MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
+                          mRsp->P_matrix);
+            } else {
+                /* Preserve the original interpreter's legal 1 -> 0 state, but
+                 * make it safe: identity modelview instead of any [-1] access. */
+                memcpy(mRsp->MP_matrix, mRsp->P_matrix, sizeof(mRsp->MP_matrix));
+#ifdef __vita__
+                static unsigned int sMtxEmptyEnterBudget = 32;
+                if (sMtxEmptyEnterBudget > 0) {
+                    --sMtxEmptyEnterBudget;
+                    port_log("SSB64: GFX_MTX_EMPTY_ENTER action=projection-only\n");
+                }
+#endif
+            }
         } else {
 #ifdef __vita__
             static unsigned int sMtxUnderflowBudget = 64;
             if (sMtxUnderflowBudget > 0) {
                 --sMtxUnderflowBudget;
-                port_log("SSB64: GFX_MTX_STACK_UNDERFLOW depth=%u action=keep-base\n",
-                         (unsigned int)mRsp->modelview_matrix_stack_size);
+                port_log("SSB64: GFX_MTX_STACK_UNDERFLOW depth=0 action=ignore-pop\n");
             }
 #endif
-            mRsp->modelview_matrix_stack_size = 1;
         }
     }
     mRsp->lights_changed = true;
@@ -3799,10 +3836,16 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         float world_pos[3] = { 0.0 };
         if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
-            float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-            world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
-            world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
-            world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+            if (mRsp->modelview_matrix_stack_size > 0) {
+                float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+                world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
+                world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
+                world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+            } else {
+                world_pos[0] = v->ob[0];
+                world_pos[1] = v->ob[1];
+                world_pos[2] = v->ob[2];
+            }
         }
 
         x = AdjXForAspectRatio(x);
@@ -3840,8 +3883,14 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
                     // Transform distance vector (which acts as a direction light vector) into model's space
                     float light_model[3];
-                    TransposedMatrixMul(light_model, dist_vec,
-                                        mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+                    if (mRsp->modelview_matrix_stack_size > 0) {
+                        TransposedMatrixMul(light_model, dist_vec,
+                                            mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+                    } else {
+                        light_model[0] = dist_vec[0];
+                        light_model[1] = dist_vec[1];
+                        light_model[2] = dist_vec[2];
+                    }
 
                     // Calculate intensity for each axis using standard formula for intensity
                     float light_intensity[3];
@@ -8809,7 +8858,7 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
     {
         const uint32_t finalMtxDepth = (uint32_t)mRsp->modelview_matrix_stack_size;
         static unsigned int sTaskBoundsBudget = 64;
-        if ((finalMtxDepth != 1u || vitaMaxDLDepth >= 32u) && sTaskBoundsBudget > 0) {
+        if ((finalMtxDepth > 11u || vitaMaxDLDepth >= 32u) && sTaskBoundsBudget > 0) {
             --sTaskBoundsBudget;
             port_log("SSB64: GFX_RSP_TASK_BOUNDS final_mtx=%u max_mtx=%u max_dl_depth=%u\n",
                      finalMtxDepth, vitaMaxMtxDepth, vitaMaxDLDepth);
