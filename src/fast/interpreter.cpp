@@ -61,6 +61,7 @@
 #endif
 
 extern "C" void* portRelocTryResolvePointer(uint32_t token);
+extern "C" int portRelocIsPointerToken(uint32_t token);
 extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base, size_t* out_size);
 extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
                                          uint32_t* out_file_id, const char** out_path);
@@ -594,6 +595,26 @@ static VitaFighterGeomStats sVitaKongoGeomStats = { kVitaKongoStageFileId };
 static VitaFighterGeomStats sVitaMarioGeomStats = { kVitaMarioModelFileId };
 static VitaFighterGeomStats sVitaFoxGeomStats = { kVitaFoxModelFileId };
 static VitaFighterGeomStats sVitaDonkeyGeomStats = { kVitaDonkeyModelFileId };
+
+// Performance 2026-08-23: this whole Mario/Pikachu-rendering-defect debug
+// facility costs a real, unconditional per-draw tax when left always-on --
+// gfx_vtx_handler_f3dex2() calls portRelocDescribePointer() (a *linear scan*
+// over sPortRelocFileRanges, port/bridge/lbreloc_bridge.cpp) on every single
+// G_VTX command, and GfxSpTri1() below does per-vertex-source-array lookups
+// on every triangle. That's the identical class of bug -- an O(n) scan on a
+// hot per-draw path -- that commit b25239a already fixed for texture byte-
+// swapping (see docs/vita_current_handoff_2026-08-21.md's "confirmed 60 FPS"
+// note, measured *before* this facility existed). A fresh ssb64.log capture
+// showed sustained 48-59 fps with idle_frames=0 (i.e. not loading stalls),
+// which stopped once this was gated off. Default OFF; opt in with
+// SSB64_VITA_FIGHTER_GEOM_DEBUG=1 only while actively working the Mario/
+// Pikachu bug, and gate it off again before measuring frame rate for
+// anything else. Checked once and cached -- callers must still gate on this
+// before doing any of the expensive work, not just before logging.
+static bool VitaFighterGeomDebugEnabled() {
+    static const bool enabled = (getenv("SSB64_VITA_FIGHTER_GEOM_DEBUG") != nullptr);
+    return enabled;
+}
 
 static VitaFighterGeomStats* VitaFighterGeomStatsForFile(uint32_t file_id) {
     if (file_id == kVitaCastleStageFileId) {
@@ -3512,6 +3533,38 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
 }
 
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
+    /* v11 safety net: an unresolved/stale matrix pointer must not become a
+     * Vita data-abort in the fixed-point decoder below. Callers normally guard
+     * this already; keep the callee defensive because custom handlers can also
+     * reach this function. */
+    if (addr == nullptr) {
+#ifdef __vita__
+        static unsigned int sNullMatrixDropBudget = 16;
+        if (sNullMatrixDropBudget > 0) {
+            --sNullMatrixDropBudget;
+            port_log("SSB64: GFX_MTX_NULL_DROP parameters=0x%02X\n", parameters);
+        }
+#endif
+        return;
+    }
+
+#ifdef __vita__
+    /* v12: RSP matrix-stack invariant. Several hot paths index
+     * modelview_matrix_stack_size - 1 without any independent bounds check.
+     * A single malformed/unbalanced G_POPMTX must therefore never leave the
+     * depth at 0 (underflow) or above the physical 11-entry array. */
+    if (mRsp->modelview_matrix_stack_size == 0 || mRsp->modelview_matrix_stack_size > 11) {
+        const unsigned int bad_depth = (unsigned int)mRsp->modelview_matrix_stack_size;
+        static unsigned int sMtxDepthRepairBudget = 32;
+        mRsp->modelview_matrix_stack_size = (bad_depth == 0) ? 1 : 11;
+        if (sMtxDepthRepairBudget > 0) {
+            --sMtxDepthRepairBudget;
+            port_log("SSB64: GFX_MTX_DEPTH_REPAIR context=GfxSpMatrix bad=%u repaired=%u\n",
+                     bad_depth, (unsigned int)mRsp->modelview_matrix_stack_size);
+        }
+    }
+#endif
+
     float matrix[4][4];
 
     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
@@ -3550,10 +3603,21 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
             MatrixMul(mRsp->P_matrix, matrix, mRsp->P_matrix);
         }
     } else { // G_MTX_MODELVIEW
-        if ((parameters & mtx_push) && mRsp->modelview_matrix_stack_size < 11) {
-            ++mRsp->modelview_matrix_stack_size;
-            memcpy(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
-                   mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 2], sizeof(matrix));
+        if (parameters & mtx_push) {
+            if (mRsp->modelview_matrix_stack_size < 11) {
+                ++mRsp->modelview_matrix_stack_size;
+                memcpy(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
+                       mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 2], sizeof(matrix));
+            } else {
+#ifdef __vita__
+                static unsigned int sMtxOverflowBudget = 32;
+                if (sMtxOverflowBudget > 0) {
+                    --sMtxOverflowBudget;
+                    port_log("SSB64: GFX_MTX_STACK_OVERFLOW depth=%u action=ignore-push\n",
+                             (unsigned int)mRsp->modelview_matrix_stack_size);
+                }
+#endif
+            }
         }
         if (parameters & mtx_load) {
             if (mRsp->modelview_matrix_stack_size == 0)
@@ -3570,12 +3634,23 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
 
 void Interpreter::GfxSpPopMatrix(uint32_t count) {
     while (count--) {
-        if (mRsp->modelview_matrix_stack_size > 0) {
+        /* The base model-view matrix is slot 0 and is always logically
+         * present. Allowing depth 1 -> 0 makes every subsequent
+         * stack_size-1 access index before modelview_matrix_stack[]. */
+        if (mRsp->modelview_matrix_stack_size > 1) {
             --mRsp->modelview_matrix_stack_size;
-            if (mRsp->modelview_matrix_stack_size > 0) {
-                MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
-                          mRsp->P_matrix);
+            MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
+                      mRsp->P_matrix);
+        } else {
+#ifdef __vita__
+            static unsigned int sMtxUnderflowBudget = 64;
+            if (sMtxUnderflowBudget > 0) {
+                --sMtxUnderflowBudget;
+                port_log("SSB64: GFX_MTX_STACK_UNDERFLOW depth=%u action=keep-base\n",
+                         (unsigned int)mRsp->modelview_matrix_stack_size);
             }
+#endif
+            mRsp->modelview_matrix_stack_size = 1;
         }
     }
     mRsp->lights_changed = true;
@@ -3910,6 +3985,18 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t val) {
     SUPPORT_CHECK(where == G_MWO_POINT_ST);
 
+    if (vtx_idx >= MAX_VERTICES + 4) {
+#ifdef __vita__
+        static unsigned int sModifyVtxBoundsBudget = 32;
+        if (sModifyVtxBoundsBudget > 0) {
+            --sModifyVtxBoundsBudget;
+            port_log("SSB64: GFX_VTX_INDEX_OOB context=MODIFY idx=%u max=%u action=drop\n",
+                     (unsigned int)vtx_idx, (unsigned int)(MAX_VERTICES + 3));
+        }
+#endif
+        return;
+    }
+
     int16_t s = (int16_t)(val >> 16);
     int16_t t = (int16_t)val;
 
@@ -3918,13 +4005,30 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    if (vtx1_idx >= MAX_VERTICES + 4 || vtx2_idx >= MAX_VERTICES + 4 || vtx3_idx >= MAX_VERTICES + 4) {
+#ifdef __vita__
+        static unsigned int sTriBoundsBudget = 64;
+        if (sTriBoundsBudget > 0) {
+            --sTriBoundsBudget;
+            port_log("SSB64: GFX_VTX_INDEX_OOB context=TRI idx=%u,%u,%u max=%u action=drop\n",
+                     (unsigned int)vtx1_idx, (unsigned int)vtx2_idx, (unsigned int)vtx3_idx,
+                     (unsigned int)(MAX_VERTICES + 3));
+        }
+#endif
+        return;
+    }
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
 #ifdef __vita__
+    // Gated: see VitaFighterGeomDebugEnabled()'s comment. When off (the
+    // default), this skips VitaFighterGeomTriStats() entirely -- no
+    // sVitaFighterVertexSource[] lookups on this per-triangle hot path.
     VitaFighterGeomStats* fighter_geom_stats =
-        is_rect ? nullptr : VitaFighterGeomTriStats(vtx1_idx, vtx2_idx, vtx3_idx);
+        (VitaFighterGeomDebugEnabled() && !is_rect)
+            ? VitaFighterGeomTriStats(vtx1_idx, vtx2_idx, vtx3_idx)
+            : nullptr;
     if (fighter_geom_stats != nullptr) {
         fighter_geom_stats->tris_requested++;
     }
@@ -4817,6 +4921,17 @@ void Interpreter::CalcAndSetViewport(const F3DVp_t* viewport) {
 }
 
 void Interpreter::GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* data) {
+    if (data == nullptr) {
+#ifdef __vita__
+        static unsigned int sMoveMemNullBudget = 32;
+        if (sMoveMemNullBudget > 0) {
+            --sMoveMemNullBudget;
+            port_log("SSB64: GFX_MOVEMEM_NULL ucode=f3dex2 index=0x%02X offset=0x%02X action=drop\n",
+                     (unsigned int)index, (unsigned int)offset);
+        }
+#endif
+        return;
+    }
     switch (index) {
         case F3DEX2_G_MV_VIEWPORT:
             CalcAndSetViewport((const F3DVp_t*)data);
@@ -4827,7 +4942,20 @@ void Interpreter::GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* 
                 // NOTE: reads out of bounds if it is an ambient light
                 memcpy(mRsp->current_lights + lightidx, data, sizeof(F3DLight));
             } else if (lightidx < 0) {
-                memcpy(mRsp->lookat + offset / 24, data, sizeof(F3DLight_t)); // TODO Light?
+                const int lookat_idx = offset / 24;
+                if (lookat_idx >= 0 && lookat_idx < 2) {
+                    memcpy(mRsp->lookat + lookat_idx, data, sizeof(F3DLight_t)); // TODO Light?
+                }
+#ifdef __vita__
+                else {
+                    static unsigned int sLookatBoundsBudget = 16;
+                    if (sLookatBoundsBudget > 0) {
+                        --sLookatBoundsBudget;
+                        port_log("SSB64: GFX_LIGHT_INDEX_OOB context=lookat offset=0x%02X idx=%d action=drop\n",
+                                 (unsigned int)offset, lookat_idx);
+                    }
+                }
+#endif
             }
             break;
         }
@@ -4835,6 +4963,17 @@ void Interpreter::GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* 
 }
 
 void Interpreter::GfxSpMovememF3d(uint8_t index, uint8_t offset, const void* data) {
+    if (data == nullptr) {
+#ifdef __vita__
+        static unsigned int sMoveMemF3dNullBudget = 32;
+        if (sMoveMemF3dNullBudget > 0) {
+            --sMoveMemF3dNullBudget;
+            port_log("SSB64: GFX_MOVEMEM_NULL ucode=f3d index=0x%02X offset=0x%02X action=drop\n",
+                     (unsigned int)index, (unsigned int)offset);
+        }
+#endif
+        return;
+    }
     switch (index) {
         case F3DEX_G_MV_VIEWPORT:
             CalcAndSetViewport((const F3DVp_t*)data);
@@ -4859,10 +4998,22 @@ void Interpreter::GfxSpMovememF3d(uint8_t index, uint8_t offset, const void* dat
 
 void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t data) {
     switch (index) {
-        case G_MW_NUMLIGHT:
-            mRsp->current_num_lights = data / 24 + 1; // add ambient light
+        case G_MW_NUMLIGHT: {
+            uintptr_t requested = data / 24 + 1; // add ambient light
+            if (requested < 1 || requested > (MAX_LIGHTS + 1)) {
+#ifdef __vita__
+                static unsigned int sLightCountBoundsBudget = 32;
+                if (sLightCountBoundsBudget > 0) {
+                    --sLightCountBoundsBudget;
+                    port_log("SSB64: GFX_LIGHT_COUNT_OOB ucode=f3dex2 requested=%lu max=%u action=clamp\n",
+                             (unsigned long)requested, (unsigned int)(MAX_LIGHTS + 1));
+                }
+#endif
+                requested = requested < 1 ? 1 : (MAX_LIGHTS + 1);
+            }
+            mRsp->current_num_lights = (uint8_t)requested;
             mRsp->lights_changed = true;
-            break;
+        } break;
         case G_MW_LIGHTCOL: {
             // gSPLightColor(pkt, n, col) expands to two gMoveWd(G_MW_LIGHTCOL)
             // commands: one at offset aLIGHT_n (populates light.l.col) and one
@@ -4905,6 +5056,17 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+            if (segNumber < 0 || segNumber >= (int)MAX_SEGMENT_POINTERS) {
+#ifdef __vita__
+                static unsigned int sSegmentBoundsBudget = 32;
+                if (sSegmentBoundsBudget > 0) {
+                    --sSegmentBoundsBudget;
+                    port_log("SSB64: GFX_SEGMENT_INDEX_OOB ucode=f3dex2 offset=0x%X seg=%d max=%u action=drop\n",
+                             (unsigned int)offset, segNumber, (unsigned int)(MAX_SEGMENT_POINTERS - 1));
+                }
+#endif
+                break;
+            }
             uintptr_t _old = mSegmentPointers[segNumber];
             mSegmentPointers[segNumber] = data;
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT", 0);
@@ -4982,18 +5144,40 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
 
 void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t data) {
     switch (index) {
-        case G_MW_NUMLIGHT:
-            // Ambient light is included
-            // The 31st bit is a flag that lights should be recalculated
-            mRsp->current_num_lights = (data - 0x80000000U) / 32;
+        case G_MW_NUMLIGHT: {
+            // Ambient light is included. The 31st bit is a recalc flag.
+            uintptr_t requested = (data - 0x80000000U) / 32;
+            if (requested < 1 || requested > (MAX_LIGHTS + 1)) {
+#ifdef __vita__
+                static unsigned int sLightCountF3dBoundsBudget = 32;
+                if (sLightCountF3dBoundsBudget > 0) {
+                    --sLightCountF3dBoundsBudget;
+                    port_log("SSB64: GFX_LIGHT_COUNT_OOB ucode=f3d requested=%lu max=%u action=clamp\n",
+                             (unsigned long)requested, (unsigned int)(MAX_LIGHTS + 1));
+                }
+#endif
+                requested = requested < 1 ? 1 : (MAX_LIGHTS + 1);
+            }
+            mRsp->current_num_lights = (uint8_t)requested;
             mRsp->lights_changed = true;
-            break;
+        } break;
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
             mRsp->fog_offset = (int16_t)data;
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+            if (segNumber < 0 || segNumber >= (int)MAX_SEGMENT_POINTERS) {
+#ifdef __vita__
+                static unsigned int sSegmentF3dBoundsBudget = 32;
+                if (sSegmentF3dBoundsBudget > 0) {
+                    --sSegmentF3dBoundsBudget;
+                    port_log("SSB64: GFX_SEGMENT_INDEX_OOB ucode=f3d offset=0x%X seg=%d max=%u action=drop\n",
+                             (unsigned int)offset, segNumber, (unsigned int)(MAX_SEGMENT_POINTERS - 1));
+                }
+#endif
+                break;
+            }
             uintptr_t _old = mSegmentPointers[segNumber];
             mSegmentPointers[segNumber] = data;
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT", 0);
@@ -6077,10 +6261,26 @@ void Interpreter::Gfxs2dexRecyCopy(F3DuObjSprite* spr) {
 
 void* Interpreter::SegAddr(uintptr_t w1) {
     if (w1 <= UINT32_MAX) {
-        void* relocPtr = portRelocTryResolvePointer((uint32_t)w1);
+        const uint32_t raw32 = (uint32_t)w1;
+        void* relocPtr = portRelocTryResolvePointer(raw32);
 
         if (relocPtr != nullptr) {
             return relocPtr;
+        }
+
+        /* v10: a stale reloc token must never fall through into the N64
+         * segmented-address path or be returned as a raw host pointer. The
+         * token namespace is stable even after its slot has been invalidated,
+         * so liveness and type can be checked independently. */
+        if (portRelocIsPointerToken(raw32)) {
+#ifdef __vita__
+            static unsigned int sStaleTokenDropBudget = 24;
+            if (sStaleTokenDropBudget > 0) {
+                --sStaleTokenDropBudget;
+                port_log("SSB64: RELOC_TOKEN_STALE_DROP context=SegAddr token=0x%08X\n", raw32);
+            }
+#endif
+            return nullptr;
         }
     }
 
@@ -6512,6 +6712,10 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     }
 
 #ifdef __vita__
+    // Gated: see VitaFighterGeomDebugEnabled()'s comment. When off (the
+    // default), this skips portRelocDescribePointer() entirely -- no linear
+    // scan over sPortRelocFileRanges on every G_VTX command.
+    if (VitaFighterGeomDebugEnabled())
     {
         uintptr_t resource_base = 0;
         size_t resource_size = 0;
@@ -6672,6 +6876,21 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = gInstance;
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+
+    /* A stale tagged reloc token resolves to NULL in SegAddr. Do not let a
+     * no-push G_DL branch install that NULL as the next command pointer. */
+    if (subGFX == nullptr && cmd->words.w1 <= UINT32_MAX &&
+        portRelocIsPointerToken((uint32_t)cmd->words.w1)) {
+#ifdef __vita__
+        static unsigned int sStaleDlDropBudget = 24;
+        if (sStaleDlDropBudget > 0) {
+            --sStaleDlDropBudget;
+            port_log("SSB64: RELOC_TOKEN_STALE_DROP context=G_DL token=0x%08X\n",
+                     (uint32_t)cmd->words.w1);
+        }
+#endif
+        return false;
+    }
 
     // PORT: Resolve ambiguous segment-0x0E G_DL commands using the resource
     // context of the *normalized* caller command.  cmd usually points into a
@@ -6995,10 +7214,22 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = gInstance;
     F3DGfx* cmd = (*cmd0);
 
-    uint8_t vbidx = (uint8_t)((*cmd0)->words.w0 & 0x00000FFF);
+    uint16_t vbidx = (uint16_t)((*cmd0)->words.w0 & 0x00000FFF);
     uint32_t zval = (uint32_t)((*cmd0)->words.w1);
 
     (*cmd0)++;
+
+    if (vbidx >= MAX_VERTICES + 4) {
+#ifdef __vita__
+        static unsigned int sBranchZBoundsBudget = 32;
+        if (sBranchZBoundsBudget > 0) {
+            --sBranchZBoundsBudget;
+            port_log("SSB64: GFX_VTX_INDEX_OOB context=BRANCH_Z idx=%u max=%u action=drop-branch\n",
+                     (unsigned int)vbidx, (unsigned int)(MAX_VERTICES + 3));
+        }
+#endif
+        return false;
+    }
 
     if (gfx->mRsp->loaded_vertices[vbidx].z <= zval ||
         (gfx->mRsp->extra_geometry_mode & G_EX_ALWAYS_EXECUTE_BRANCH) != 0) {
@@ -8476,6 +8707,8 @@ void Interpreter::RunGuiOnly() {
 void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>& mtx_replacements) {
 #ifdef __vita__
     const uint32_t vitaRunStartUs = sceKernelGetProcessTimeLow();
+    uint32_t vitaMaxDLDepth = 0;
+    uint32_t vitaMaxMtxDepth = 0;
 #endif
     SpReset();
     mFrameTriAreaPx = 0.0f;
@@ -8520,6 +8753,14 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
 #endif
     while (!g_exec_stack.cmd_stack.empty()) {
         auto cmd = g_exec_stack.cmd_stack.top();
+#ifdef __vita__
+        if (g_exec_stack.cmd_stack.size() > vitaMaxDLDepth) {
+            vitaMaxDLDepth = (uint32_t)g_exec_stack.cmd_stack.size();
+        }
+        if (mRsp->modelview_matrix_stack_size > vitaMaxMtxDepth) {
+            vitaMaxMtxDepth = (uint32_t)mRsp->modelview_matrix_stack_size;
+        }
+#endif
 
         if (dbg->IsDebugging()) {
             g_exec_stack.gfx_path.push_back(cmd);
@@ -8565,6 +8806,15 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
     }
 
 #ifdef __vita__
+    {
+        const uint32_t finalMtxDepth = (uint32_t)mRsp->modelview_matrix_stack_size;
+        static unsigned int sTaskBoundsBudget = 64;
+        if ((finalMtxDepth != 1u || vitaMaxDLDepth >= 32u) && sTaskBoundsBudget > 0) {
+            --sTaskBoundsBudget;
+            port_log("SSB64: GFX_RSP_TASK_BOUNDS final_mtx=%u max_mtx=%u max_dl_depth=%u\n",
+                     finalMtxDepth, vitaMaxMtxDepth, vitaMaxDLDepth);
+        }
+    }
     const uint32_t vitaRunUs = sceKernelGetProcessTimeLow() - vitaRunStartUs;
     sVitaFast3DStats.frames++;
     sVitaFast3DStats.walk_us += vitaWalkUs;
