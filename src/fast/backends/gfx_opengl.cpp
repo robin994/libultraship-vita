@@ -51,6 +51,10 @@ extern "C" {
     size_t vglMemFree(vglMemType type);
     void* vglAllocFromScratch(size_t size);
     void vglBufferData(GLenum target, const GLvoid *data);
+    unsigned char port_diag_get_scene_curr(void);
+    unsigned char port_diag_get_stage_kind(void);
+    unsigned int port_diag_get_task_frame_count(void);
+    unsigned int portRelocGetLifetimeGeneration(void);
     // vitaGL implements glAttachShader/glCompileShader/glCreateShader/
     // glDeleteShader/glLinkProgram but not glDetachShader. imgui's OpenGL3
     // backend calls it as a post-link cleanup step (optional per the GL
@@ -1357,6 +1361,35 @@ void GfxRenderingAPIOGL::EndFrame() {
     static uint64_t sVitaRenderApiUs = 0;
     static uint64_t sVitaRenderGlDrawUs = 0;
     static uint32_t sVitaRenderApiFrameMaxUs = 0;
+    static uint8_t sVitaDiagScene = UINT8_MAX;
+    static uint8_t sVitaDiagStage = UINT8_MAX;
+    static uint32_t sVitaDiagTaskFrame = UINT32_MAX;
+
+    const uint8_t vitaDiagScene = port_diag_get_scene_curr();
+    const uint8_t vitaDiagStage = port_diag_get_stage_kind();
+    const uint32_t vitaDiagTaskFrame = port_diag_get_task_frame_count();
+
+    /* First-frame renderer signature for every scene entry.  The previous
+     * 300-frame aggregate mixed stage select and gameplay, which made an
+     * intermittent first-load failure impossible to compare against a good
+     * reload of the same stage.  This is bounded to one compact line per
+     * task frame (0..7), including actual backend draws/triangles. */
+    if (vitaDiagTaskFrame < 8 &&
+        (vitaDiagScene != sVitaDiagScene || vitaDiagStage != sVitaDiagStage ||
+         vitaDiagTaskFrame != sVitaDiagTaskFrame)) {
+        port_log("SSB64: VITA_SCENE_RENDER scene=%u stage=%u task_frame=%u generation=%u "
+                 "renderer_frame=%u draws=%u tris=%u vbo_bytes=%u draw_api_us=%u "
+                 "gl_draw_us=%u dropped_total=%u\n",
+                 (unsigned int)vitaDiagScene, (unsigned int)vitaDiagStage,
+                 vitaDiagTaskFrame, portRelocGetLifetimeGeneration(),
+                 (unsigned int)mFrameCount, (unsigned int)sVitaVboFrameDraws,
+                 (unsigned int)sVitaVboFrameTris, (unsigned int)sVitaVboFrameBytes,
+                 (unsigned int)sVitaDrawApiFrameUs, (unsigned int)sVitaGlDrawFrameUs,
+                 (unsigned int)sVitaVboDroppedDraws);
+        sVitaDiagScene = vitaDiagScene;
+        sVitaDiagStage = vitaDiagStage;
+        sVitaDiagTaskFrame = vitaDiagTaskFrame;
+    }
 
     if (mFrameCount <= 3) {
         port_log("SSB64: Vita VBO frame=%u bytes=%u draws=%u peak=%u dropped_total=%u\n",
