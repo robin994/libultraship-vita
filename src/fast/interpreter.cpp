@@ -60,15 +60,21 @@
 #include <sanitizer/asan_interface.h>
 #endif
 
+extern "C" void port_log(const char *fmt, ...);
 extern "C" void* portRelocTryResolvePointer(uint32_t token);
 extern "C" int portRelocIsPointerToken(uint32_t token);
 extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base, size_t* out_size);
 extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
                                          uint32_t* out_file_id, const char** out_path);
+extern "C" unsigned int portRelocGetLifetimeGeneration(void);
 extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
+extern "C" int portRelocIsManifestDisplayListTarget(const void* ptr);
 extern "C" int portRelocDecodeVerticesForRuntime(const void *addr, unsigned int num_vtx,
                                                      void *out_vertices, size_t out_size);
+extern "C" int portRelocNormalizeVerticesForTypedConsumer(const void *addr,
+                                                             unsigned int num_vtx);
 extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int num_bytes);
+extern "C" const void* portRelocDecodeTextureForRuntime(const void *addr, unsigned int num_bytes);
 
 /* Game-specific DL safety hooks. The embedding game (e.g. SSB64) registers
  * a bounds-check and an address classifier via the public API in
@@ -133,7 +139,75 @@ struct PortPackedDisplayListInfo {
     std::shared_ptr<std::vector<Fast::F3DGfx>> commands;
 };
 
+struct PortPackedVertexRange {
+    uintptr_t address;
+    unsigned int count;
+};
+
+struct PortPackedPreflightInfo {
+    unsigned int lifetimeGeneration;
+    std::vector<PortPackedVertexRange> vertexRanges;
+};
+
 std::unordered_map<const void*, PortPackedDisplayListInfo> sPortPackedDisplayListCache;
+std::unordered_map<const void*, PortPackedPreflightInfo> sPortPackedPreflightValidCache;
+
+/*
+ * Segment 0x0E is overloaded by SSB64: stored model DLs use it both for
+ * owner-local sublists and for the per-DObj material DL built on the graphics
+ * heap. Structural inspection cannot distinguish those meanings reliably --
+ * palette bytes can form a perfectly terminating command stream by accident.
+ *
+ * gcDrawMObjForDObj emits a runtime segment-0x0E write immediately before the
+ * G_DL that owns that material buffer. Track that execution scope explicitly:
+ * while the owning model call is on the DL stack, the live runtime segment is
+ * authoritative; after it returns, typed owner-local provenance is allowed to
+ * win over the now-stale segment binding. This follows the command stream's
+ * producer/consumer lifetime without file, model, fighter, or stage IDs.
+ */
+static bool sPortSeg0ERuntimePendingOwner = false;
+static size_t sPortSeg0ERuntimeOwnerDepth = 0;
+
+static void portResetSeg0ERuntimeScope() {
+    sPortSeg0ERuntimePendingOwner = false;
+    sPortSeg0ERuntimeOwnerDepth = 0;
+}
+
+static void portTrackSeg0EWrite(uintptr_t data) {
+    uintptr_t fileBase = 0;
+    size_t fileSize = 0;
+    const bool isRuntimeHeap = data >= 0x10000u &&
+        !portRelocFindContainingFile(reinterpret_cast<const void*>(data), &fileBase, &fileSize);
+
+    if (isRuntimeHeap) {
+        sPortSeg0ERuntimePendingOwner = true;
+        sPortSeg0ERuntimeOwnerDepth = 0;
+    } else {
+        portResetSeg0ERuntimeScope();
+    }
+}
+
+static bool portSeg0ERuntimeScopeForDL(bool isSegment0ECall) {
+    const size_t depth = Fast::g_exec_stack.cmd_stack.size();
+
+    if (sPortSeg0ERuntimeOwnerDepth != 0 && depth < sPortSeg0ERuntimeOwnerDepth) {
+        sPortSeg0ERuntimeOwnerDepth = 0;
+    }
+
+    if (sPortSeg0ERuntimePendingOwner) {
+        /* The next G_DL after gcDrawMObjForDObj's segment write is the model
+         * that consumes the material buffer. Calls made from that model run
+         * one level deeper in the execution stack. */
+        sPortSeg0ERuntimePendingOwner = false;
+        sPortSeg0ERuntimeOwnerDepth = depth + 1u;
+        return isSegment0ECall;
+    }
+
+    return isSegment0ECall && sPortSeg0ERuntimeOwnerDepth != 0 &&
+        depth >= sPortSeg0ERuntimeOwnerDepth;
+}
+
+static bool portPackedOpcodePlausible(uint8_t opcode);
 
 bool portFindNormalizedDisplayListCommand(const Fast::F3DGfx* cmd, const PortPackedDisplayListInfo** outInfo,
                                           size_t* outIndex) {
@@ -156,12 +230,10 @@ bool portFindNormalizedDisplayListCommand(const Fast::F3DGfx* cmd, const PortPac
 }
 
 // A segment-0x0E G_DL in a packed reloc resource is ambiguous on the port:
-// some commands branch to another packed DL in the same file, while fighter
-// material setup can deliberately point segment 0x0E at a runtime-built native
-// Gfx buffer.  Do not decide purely from whether segment 0x0E is currently set.
-// Validate the in-file candidate first.  This also avoids the historical
-// regression where an unrelated/stale runtime segment-E base stole an
-// intra-file model branch and produced partial geometry.
+// some commands branch to another packed DL in the same file, while material
+// setup can point segment 0x0E at a runtime-built native Gfx buffer.  When the
+// runtime segment is unbound, this bounded structural check is the only path
+// that may classify the target as an owner-local packed list.
 static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fileSize, uint32_t offset) {
     if (fileBase == 0 || offset >= fileSize || (offset & (PORT_PACKED_GFX_SIZE - 1)) != 0) {
         return false;
@@ -173,7 +245,7 @@ static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fil
     }
 
     const uint8_t* raw = reinterpret_cast<const uint8_t*>(fileBase + offset);
-    const size_t maxCommands = std::min<size_t>(available / PORT_PACKED_GFX_SIZE, 256);
+    const size_t maxCommands = std::min<size_t>(available / PORT_PACKED_GFX_SIZE, 16384u);
 
     // An all-zero packed command is G_SPNOOP, but a branch target beginning
     // with eight zero bytes is not a useful resource display-list entry point.
@@ -195,9 +267,7 @@ static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fil
         const uint32_t w1 = words[1];
         const uint8_t opcode = static_cast<uint8_t>(w0 >> 24);
 
-        // F3DEX2 resource DL opcodes occupy 0x00..0x0F and 0xD7..0xFF.
-        // The same validity rule is used by portNormalizeDisplayListPointer.
-        if (opcode > 0x0F && opcode < 0xD7) {
+        if (portRelocTryResolvePointer(w0) != nullptr || !portPackedOpcodePlausible(opcode)) {
             return false;
         }
 
@@ -223,12 +293,446 @@ static bool portPackedDisplayListTargetLooksValid(uintptr_t fileBase, size_t fil
     return false;
 }
 
+struct PortPackedPreflightFailure {
+    const char* reason = nullptr;
+    uintptr_t fileBase = 0;
+    size_t fileSize = 0;
+    uint32_t offset = 0;
+    uint8_t opcode = 0;
+    uint32_t w0 = 0;
+    uint32_t w1 = 0;
+    uintptr_t target = 0;
+};
+
+static bool portPackedOpcodePlausible(uint8_t opcode) {
+    // Match the F3DEX2/RDP opcodes this interpreter actually implements for
+    // packed game resources.  Do not use a broad numeric range: accepting an
+    // unhandled opcode is just another form of partial rendering.
+    switch (opcode) {
+        case 0x00: // G_NOOP
+        case 0x01: // G_VTX
+        case 0x02: // G_MODIFYVTX
+        case 0x03: // G_CULLDL
+        case 0x05: // G_TRI1
+        case 0x06: // G_TRI2
+        case 0x07: // G_QUAD
+        case 0x09: // mixed S2DEX G_BG_1CYC
+        case 0x0A: // mixed S2DEX G_BG_COPY
+        case 0x45: // RDP_G_SETTILESIZE_INTERP
+        case 0x46: // RDP_G_SETTARGETINTERPINDEX
+        case 0xC0: // RDP NOOP
+        case 0xD5: // G_SPECIAL_1 / MVP recalc no-op on port
+        case 0xD7: // G_TEXTURE
+        case 0xD8: // G_POPMTX
+        case 0xD9: // G_GEOMETRYMODE
+        case 0xDA: // G_MTX
+        case 0xDB: // G_MOVEWORD
+        case 0xDC: // G_MOVEMEM
+        case 0xDD: // G_LOAD_UCODE
+        case 0xDE: // G_DL
+        case 0xDF: // G_ENDDL
+        case 0xE0: // G_SPNOOP
+        case 0xE1: // RDPHALF_1
+        case 0xE2: // SETOTHERMODE_L
+        case 0xE3: // SETOTHERMODE_H
+            return true;
+        case 0xE4: // TEXRECT
+        case 0xE5: // TEXRECTFLIP
+        case 0xE6: // RDPLOADSYNC
+        case 0xE7: // RDPPIPESYNC
+        case 0xE8: // RDPTILESYNC
+        case 0xE9: // RDPFULLSYNC
+        case 0xEC: // SETCONVERT
+        case 0xED: // SETSCISSOR
+        case 0xEE: // SETPRIMDEPTH
+        case 0xEF: // RDPSETOTHERMODE
+        case 0xF0: // LOADTLUT
+        case 0xF2: // SETTILESIZE
+        case 0xF3: // LOADBLOCK
+        case 0xF4: // LOADTILE
+        case 0xF5: // SETTILE
+        case 0xF6: // FILLRECT
+        case 0xF7: // SETFILLCOLOR
+        case 0xF8: // SETFOGCOLOR
+        case 0xF9: // SETBLENDCOLOR
+        case 0xFA: // SETPRIMCOLOR
+        case 0xFB: // SETENVCOLOR
+        case 0xFC: // SETCOMBINE
+        case 0xFD: // SETTIMG
+        case 0xFE: // SETZIMG
+        case 0xFF: // SETCIMG
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool portPackedResolvePreflightTarget(uint32_t raw, uintptr_t ownerBase, size_t ownerSize,
+                                             uintptr_t* outTarget, bool* outDeferredSegment) {
+    if (outTarget != nullptr) {
+        *outTarget = 0;
+    }
+    if (outDeferredSegment != nullptr) {
+        *outDeferredSegment = false;
+    }
+    void* tokenTarget = raw != 0 ? portRelocTryResolvePointer(raw) : nullptr;
+    if (tokenTarget != nullptr) {
+        if (outTarget != nullptr) {
+            *outTarget = reinterpret_cast<uintptr_t>(tokenTarget);
+        }
+        return true;
+    }
+
+    if (portRelocIsPointerToken(raw)) {
+        // Tagged token that no longer resolves: never reinterpret as a segment.
+        return false;
+    }
+
+    const uint8_t seg = static_cast<uint8_t>(raw >> 24);
+    const uint32_t off = raw & 0x00FFFFFFu;
+    if (seg == 0x0Eu && static_cast<size_t>(off) < ownerSize) {
+        if (outTarget != nullptr) {
+            *outTarget = ownerBase + off;
+        }
+        return true;
+    }
+
+    // Other classic N64 segment references depend on gsSPSegment state built
+    // by the enclosing runtime task.  They cannot be proven before execution,
+    // but they are not host pointers either, so mark them explicitly deferred.
+    if (seg < Fast::MAX_SEGMENT_POINTERS) {
+        if (outDeferredSegment != nullptr) {
+            *outDeferredSegment = true;
+        }
+        return true;
+    }
+
+    // A raw 32-bit value outside the segment namespace is neither a live reloc
+    // token nor a valid N64 segmented pointer in a packed resource.
+    return false;
+}
+
+static bool portPackedTargetSpanValid(uintptr_t target, size_t bytes) {
+    if (target == 0 || bytes == 0) {
+        return false;
+    }
+    uintptr_t base = 0;
+    size_t size = 0;
+    if (!portRelocFindContainingFile(reinterpret_cast<const void*>(target), &base, &size)) {
+        return false;
+    }
+    if (target < base) {
+        return false;
+    }
+    const size_t off = static_cast<size_t>(target - base);
+    return off <= size && bytes <= size - off;
+}
+
+static bool portPackedDisplayListPreflightInternal(const void* root, PortPackedPreflightFailure* failure) {
+    if (failure != nullptr) {
+        *failure = {};
+    }
+    if (root == nullptr) {
+        if (failure != nullptr) {
+            failure->reason = "null-root";
+        }
+        return false;
+    }
+
+    uintptr_t ownerBase = 0;
+    size_t ownerSize = 0;
+    if (!portRelocFindContainingFile(root, &ownerBase, &ownerSize)) {
+        // Heap/native display lists are already protected by runtime bounds
+        // checks.  This strict packed validator is only for reloc-backed data.
+        return true;
+    }
+    const unsigned int lifetimeGeneration = portRelocGetLifetimeGeneration();
+    auto cachedPreflight = sPortPackedPreflightValidCache.find(root);
+    if (cachedPreflight != sPortPackedPreflightValidCache.end()) {
+        if (cachedPreflight->second.lifetimeGeneration == lifetimeGeneration) {
+            /* Range-level endian state can be evicted independently when a
+             * dependency buffer is overwritten. Reassert the proven type on
+             * cache hits; the byteswap side is per-Vtx idempotent. */
+            for (const PortPackedVertexRange& range : cachedPreflight->second.vertexRanges) {
+                if (!portRelocNormalizeVerticesForTypedConsumer(
+                        reinterpret_cast<const void*>(range.address), range.count)) {
+                    if (failure != nullptr) {
+                        failure->reason = "vtx-normalize-failed";
+                        failure->fileBase = ownerBase;
+                        failure->fileSize = ownerSize;
+                        failure->target = range.address;
+                    }
+                    return false;
+                }
+            }
+            return true;
+        }
+        sPortPackedPreflightValidCache.erase(cachedPreflight);
+    }
+
+    const uintptr_t rootAddr = reinterpret_cast<uintptr_t>(root);
+    if (rootAddr < ownerBase || ((rootAddr - ownerBase) & (PORT_PACKED_GFX_SIZE - 1u)) != 0u) {
+        if (failure != nullptr) {
+            failure->reason = "root-misaligned";
+            failure->fileBase = ownerBase;
+            failure->fileSize = ownerSize;
+            failure->target = rootAddr;
+        }
+        return false;
+    }
+
+    std::vector<uintptr_t> queue;
+    queue.reserve(32);
+    queue.push_back(rootAddr);
+    std::unordered_set<uintptr_t> visited;
+    visited.reserve(64);
+    std::map<uintptr_t, unsigned int> provenVertexRanges;
+
+    size_t totalCommands = 0;
+    while (!queue.empty()) {
+        const uintptr_t listAddr = queue.back();
+        queue.pop_back();
+        if (!visited.insert(listAddr).second) {
+            continue;
+        }
+        if (visited.size() > 4096u) {
+            if (failure != nullptr) {
+                failure->reason = "dl-graph-too-large";
+                failure->fileBase = ownerBase;
+                failure->fileSize = ownerSize;
+                failure->target = listAddr;
+            }
+            return false;
+        }
+
+        uintptr_t listBase = 0;
+        size_t listFileSize = 0;
+        if (!portRelocFindContainingFile(reinterpret_cast<const void*>(listAddr), &listBase, &listFileSize)) {
+            if (failure != nullptr) {
+                failure->reason = "dl-target-unregistered";
+                failure->target = listAddr;
+            }
+            return false;
+        }
+        if (listAddr < listBase || ((listAddr - listBase) & (PORT_PACKED_GFX_SIZE - 1u)) != 0u) {
+            if (failure != nullptr) {
+                failure->reason = "dl-target-misaligned";
+                failure->fileBase = listBase;
+                failure->fileSize = listFileSize;
+                failure->target = listAddr;
+            }
+            return false;
+        }
+
+        const size_t startOff = static_cast<size_t>(listAddr - listBase);
+        if (startOff + PORT_PACKED_GFX_SIZE > listFileSize) {
+            if (failure != nullptr) {
+                failure->reason = "dl-target-oob";
+                failure->fileBase = listBase;
+                failure->fileSize = listFileSize;
+                failure->offset = static_cast<uint32_t>(startOff);
+                failure->target = listAddr;
+            }
+            return false;
+        }
+
+        const size_t maxCommands = (listFileSize - startOff) / PORT_PACKED_GFX_SIZE;
+        bool terminated = false;
+        for (size_t i = 0; i < maxCommands; ++i) {
+            if (++totalCommands > 16384u) {
+                if (failure != nullptr) {
+                    failure->reason = "command-budget";
+                    failure->fileBase = listBase;
+                    failure->fileSize = listFileSize;
+                    failure->offset = static_cast<uint32_t>(startOff + i * PORT_PACKED_GFX_SIZE);
+                }
+                return false;
+            }
+
+            const uintptr_t cmdAddr = listAddr + i * PORT_PACKED_GFX_SIZE;
+            const uint32_t* raw = reinterpret_cast<const uint32_t*>(cmdAddr);
+            const uint32_t w0 = raw[0];
+            const uint32_t w1 = raw[1];
+            const uint8_t opcode = static_cast<uint8_t>(w0 >> 24);
+            const uint32_t cmdOff = static_cast<uint32_t>(cmdAddr - listBase);
+
+            auto fail = [&](const char* reason, uintptr_t target = 0) {
+                if (failure != nullptr) {
+                    failure->reason = reason;
+                    failure->fileBase = listBase;
+                    failure->fileSize = listFileSize;
+                    failure->offset = cmdOff;
+                    failure->opcode = opcode;
+                    failure->w0 = w0;
+                    failure->w1 = w1;
+                    failure->target = target;
+                }
+                return false;
+            };
+
+            if (portRelocTryResolvePointer(w0) != nullptr) {
+                return fail("command-word-is-token");
+            }
+            if (!portPackedOpcodePlausible(opcode)) {
+                return fail("invalid-opcode");
+            }
+
+            if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_VTX)) {
+                const uint32_t n = (w0 >> 12) & 0xFFu;
+                const uint32_t end = (w0 & 0xFFEu) >> 1;
+                if (n == 0 || n > 32u || end > 32u || end < n || (w0 & 1u) != 0u) {
+                    return fail("vtx-command-invalid");
+                }
+                uintptr_t target = 0;
+                bool deferred = false;
+                if (!portPackedResolvePreflightTarget(w1, listBase, listFileSize, &target, &deferred)) {
+                    return fail("vtx-target-unresolved");
+                }
+                if (!deferred) {
+                    if ((target & 3u) != 0u || !portPackedTargetSpanValid(target, static_cast<size_t>(n) * 16u)) {
+                        return fail("vtx-target-oob", target);
+                    }
+                    auto foundRange = provenVertexRanges.find(target);
+                    if (foundRange == provenVertexRanges.end() || foundRange->second < n) {
+                        provenVertexRanges[target] = n;
+                    }
+                }
+            } else if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_DL)) {
+                uintptr_t target = 0;
+                bool deferred = false;
+
+                /* Segment 0x0E is assigned dynamically by material display
+                 * setup.  At model-preflight time that state does not exist,
+                 * so an offset cannot be classified as owner-local merely by
+                 * scanning the bytes at owner+offset: palettes and vertices
+                 * can accidentally look like a short valid display list.
+                 * Keep this edge deferred and validate the selected target at
+                 * execution time, after the live segment table is known. */
+                const uint8_t dlSeg = static_cast<uint8_t>(w1 >> 24);
+                const uint32_t dlOff = w1 & 0x00FFFFFFu;
+                void* tokenTarget = w1 != 0 ? portRelocTryResolvePointer(w1) : nullptr;
+                if (tokenTarget != nullptr) {
+                    target = reinterpret_cast<uintptr_t>(tokenTarget);
+                } else if (portRelocIsPointerToken(w1)) {
+                    return fail("dl-target-stale-token");
+                } else if (dlSeg == 0x0Eu) {
+                    const uintptr_t ownerTarget = listBase + dlOff;
+                    if (static_cast<size_t>(dlOff) < listFileSize &&
+                        portRelocIsManifestDisplayListTarget(reinterpret_cast<const void*>(ownerTarget))) {
+                        target = ownerTarget;
+                    } else {
+                        deferred = true;
+                    }
+                } else if (dlSeg < Fast::MAX_SEGMENT_POINTERS) {
+                    deferred = true;
+                } else {
+                    return fail("dl-target-unresolved");
+                }
+
+                if (!deferred) {
+                    if ((target & (PORT_PACKED_GFX_SIZE - 1u)) != 0u ||
+                        !portPackedTargetSpanValid(target, PORT_PACKED_GFX_SIZE)) {
+                        return fail("dl-target-oob", target);
+                    }
+                    queue.push_back(target);
+                }
+                const bool noPush = ((w0 >> 16) & 1u) != 0u;
+                if (noPush) {
+                    terminated = true;
+                    break;
+                }
+            } else if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_MTX)) {
+                uintptr_t target = 0;
+                bool deferred = false;
+                if (!portPackedResolvePreflightTarget(w1, listBase, listFileSize, &target, &deferred)) {
+                    return fail("mtx-target-unresolved");
+                }
+                if (!deferred && ((target & 3u) != 0u || !portPackedTargetSpanValid(target, 64u))) {
+                    return fail("mtx-target-oob", target);
+                }
+            } else if (opcode == static_cast<uint8_t>(Fast::RDP_G_SETTIMG)) {
+                uintptr_t target = 0;
+                bool deferred = false;
+                if (!portPackedResolvePreflightTarget(w1, listBase, listFileSize, &target, &deferred)) {
+                    return fail("texture-target-unresolved");
+                }
+                if (!deferred && !portPackedTargetSpanValid(target, 1u)) {
+                    return fail("texture-target-oob", target);
+                }
+            } else if (opcode == static_cast<uint8_t>(Fast::F3DEX2_G_ENDDL)) {
+                terminated = true;
+                break;
+            }
+        }
+
+        if (!terminated) {
+            if (failure != nullptr) {
+                failure->reason = "missing-terminator";
+                failure->fileBase = listBase;
+                failure->fileSize = listFileSize;
+                failure->offset = static_cast<uint32_t>(startOff);
+                failure->target = listAddr;
+            }
+            return false;
+        }
+    }
+
+    /* Commit only after the complete reachable graph has passed. This gives
+     * CPU-side model code the same host-order Vtx view as Fast3D without the
+     * old raw-blob/relocation-slot guesses: every mutated range is the operand
+     * of a structurally valid G_VTX in an accepted model graph. */
+    PortPackedPreflightInfo cacheInfo{};
+    cacheInfo.lifetimeGeneration = lifetimeGeneration;
+    cacheInfo.vertexRanges.reserve(provenVertexRanges.size());
+    for (const auto& [address, count] : provenVertexRanges) {
+        if (!portRelocNormalizeVerticesForTypedConsumer(
+                reinterpret_cast<const void*>(address), count)) {
+            if (failure != nullptr) {
+                failure->reason = "vtx-normalize-failed";
+                failure->fileBase = ownerBase;
+                failure->fileSize = ownerSize;
+                failure->target = address;
+            }
+            return false;
+        }
+        cacheInfo.vertexRanges.push_back(PortPackedVertexRange{ address, count });
+    }
+    sPortPackedPreflightValidCache[root] = std::move(cacheInfo);
+    return true;
+}
+
 Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
     uintptr_t fileBase = 0;
     size_t fileSize = 0;
 
     if (dlist == nullptr || !portRelocFindContainingFile(dlist, &fileBase, &fileSize)) {
         return dlist;
+    }
+
+    PortPackedPreflightFailure preflightFailure{};
+    if (!portPackedDisplayListPreflightInternal(dlist, &preflightFailure)) {
+#ifdef __vita__
+        static unsigned int sPackedPreflightRejectBudget = 128;
+        if (sPackedPreflightRejectBudget > 0) {
+            --sPackedPreflightRejectBudget;
+            uintptr_t ownerBase = 0;
+            size_t ownerSize = 0;
+            uint32_t ownerFileId = 0xFFFFFFFFu;
+            const char* ownerPath = nullptr;
+            portRelocDescribePointer(dlist, &ownerBase, &ownerSize, &ownerFileId, &ownerPath);
+            port_log("SSB64: GFX_PREFLIGHT_REJECT root=%p file=%u path=%s file_base=%p file_size=0x%x "
+                     "off=0x%x cmd_index=%u opcode=0x%02x w0=0x%08x w1=0x%08x target=%p reason=%s "
+                     "action=reject-whole-dl\n",
+                     dlist, ownerFileId, ownerPath != nullptr ? ownerPath : "(unknown)",
+                     reinterpret_cast<void*>(preflightFailure.fileBase),
+                     (unsigned int)preflightFailure.fileSize, preflightFailure.offset,
+                     preflightFailure.offset / (unsigned int)PORT_PACKED_GFX_SIZE,
+                     (unsigned int)preflightFailure.opcode, preflightFailure.w0, preflightFailure.w1,
+                     reinterpret_cast<void*>(preflightFailure.target),
+                     preflightFailure.reason != nullptr ? preflightFailure.reason : "unknown");
+        }
+#endif
+        return nullptr;
     }
 
     // Guard: runtime display lists (built on the graphics heap with native 16-byte
@@ -250,12 +754,9 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
         uintptr_t fileEnd_chk = fileBase + fileSize;
         const uint32_t* probe = reinterpret_cast<const uint32_t*>(dlist);
 
-        // DISABLED: All data-inspection heuristics have false positives.
-        // Packed DLs often start with commands that have w1=0 (sync, fog, geometry
-        // mode).  Instead of guessing, we ALWAYS normalize data found in a reloc
-        // file range.  If a native runtime DL somehow lands in a reloc range, the
-        // normalization loop's opcode validator will bail out early and produce a
-        // harmless truncated DL with G_ENDDL.
+        // DISABLED: All format-guessing heuristics have false positives.
+        // v20 no longer relies on "truncate and append G_ENDDL" as recovery: a
+        // reloc-backed root must pass strict structural preflight first.
         (void)probe;
         (void)rawAddr_chk;
         (void)fileEnd_chk;
@@ -284,8 +785,12 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
         // Valid F3DEX2 opcodes: 0x00-0x0F (SP geometry) and 0xD7-0xFF (SP/RDP).
         // Anything in 0x10-0xD6 is not a real GBI command — we've entered
         // non-DL data (textures, vertices, structs) adjacent in the blob.
-        if (opcode > 0x0F && opcode < 0xD7) {
-            break;
+        if (!portPackedOpcodePlausible(opcode)) {
+#ifdef __vita__
+            port_log("SSB64: GFX_PREFLIGHT_INTERNAL_MISMATCH root=%p off=0x%x opcode=0x%02x action=reject-whole-dl\n",
+                     dlist, (unsigned int)(rawAddr - fileBase), (unsigned int)opcode);
+#endif
+            return nullptr;
         }
 
         Fast::F3DGfx hostCmd = {};
@@ -319,24 +824,15 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
         rawAddr += PORT_PACKED_GFX_SIZE;
 
-        if (opcode == (uint8_t)Fast::F3DEX2_G_ENDDL) {
+        if (opcode == (uint8_t)Fast::F3DEX2_G_ENDDL ||
+            (opcode == (uint8_t)Fast::F3DEX2_G_DL && ((rawWords[0] >> 16) & 1u) != 0u)) {
             break;
         }
     }
 
-    // Ensure the widened DL always ends with G_ENDDL.  The opcode validation
-    // can terminate the loop early, and some source DLs use gSPBranchList
-    // (never returns) instead of gSPEndDisplayList.  Without a terminator
-    // the interpreter reads past the vector into uninitialized heap.
-    {
-        bool hasEndDL = !translated->empty() &&
-            ((uint8_t)(translated->back().words.w0 >> 24) == (uint8_t)Fast::F3DEX2_G_ENDDL);
-        if (!hasEndDL) {
-            Fast::F3DGfx endCmd = {};
-            endCmd.words.w0 = ((uintptr_t)(uint8_t)Fast::F3DEX2_G_ENDDL) << 24;
-            translated->push_back(endCmd);
-        }
-    }
+    // Strict v20 policy: never synthesize G_ENDDL to make a malformed packed
+    // list executable.  Preflight proved that the source terminates naturally
+    // via G_ENDDL or gSPBranchList; preserve that exact semantic boundary.
 
     Fast::F3DGfx* translatedPtr = translated->data();
     sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
@@ -463,8 +959,36 @@ bool gfxPointerHasReadableBytes(const void* ptr, size_t size) {
 
 } // namespace
 
+extern "C" int portValidateDisplayListPreflight(const void* dlist) {
+    PortPackedPreflightFailure failure{};
+    const bool ok = portPackedDisplayListPreflightInternal(dlist, &failure);
+#ifdef __vita__
+    if (!ok) {
+        static unsigned int sModelPreflightRejectBudget = 128;
+        if (sModelPreflightRejectBudget > 0) {
+            --sModelPreflightRejectBudget;
+            uintptr_t ownerBase = 0;
+            size_t ownerSize = 0;
+            uint32_t ownerFileId = 0xFFFFFFFFu;
+            const char* ownerPath = nullptr;
+            portRelocDescribePointer(dlist, &ownerBase, &ownerSize, &ownerFileId, &ownerPath);
+            port_log("SSB64: MODEL_DL_PREFLIGHT_REJECT dl=%p file=%u path=%s file_base=%p file_size=0x%x "
+                     "off=0x%x cmd_index=%u opcode=0x%02x w0=0x%08x w1=0x%08x target=%p reason=%s\n",
+                     dlist, ownerFileId, ownerPath != nullptr ? ownerPath : "(unknown)",
+                     reinterpret_cast<void*>(failure.fileBase), (unsigned int)failure.fileSize,
+                     failure.offset, failure.offset / (unsigned int)PORT_PACKED_GFX_SIZE,
+                     (unsigned int)failure.opcode, failure.w0, failure.w1,
+                     reinterpret_cast<void*>(failure.target),
+                     failure.reason != nullptr ? failure.reason : "unknown");
+        }
+    }
+#endif
+    return ok ? 1 : 0;
+}
+
 extern "C" void portResetPackedDisplayListCache(void) {
     sPortPackedDisplayListCache.clear();
+    sPortPackedPreflightValidCache.clear();
 }
 
 // Evict cached widened display lists whose source heap address falls in a
@@ -481,6 +1005,14 @@ extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t s
     }
     const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
     const uintptr_t hi = lo + size;
+    for (auto it = sPortPackedPreflightValidCache.begin(); it != sPortPackedPreflightValidCache.end(); ) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(it->first);
+        if (addr >= lo && addr < hi) {
+            it = sPortPackedPreflightValidCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = sPortPackedDisplayListCache.begin(); it != sPortPackedDisplayListCache.end(); ) {
         const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(it->first);
         bool evict = srcAddr >= lo && srcAddr < hi;
@@ -5118,6 +5650,9 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             }
             uintptr_t _old = mSegmentPointers[segNumber];
             mSegmentPointers[segNumber] = data;
+            if (segNumber == 0x0E) {
+                portTrackSeg0EWrite(data);
+            }
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT", 0);
         } break;
         case G_MW_SEGMENT_INTERP: {
@@ -5127,6 +5662,9 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             if (segIndex == mInterpolationIndex) {
                 uintptr_t _old = mSegmentPointers[segNumber];
                 mSegmentPointers[segNumber] = data;
+                if (segNumber == 0x0E) {
+                    portTrackSeg0EWrite(data);
+                }
                 diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT_INTERP", 0);
             }
         } break;
@@ -5229,6 +5767,9 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             }
             uintptr_t _old = mSegmentPointers[segNumber];
             mSegmentPointers[segNumber] = data;
+            if (segNumber == 0x0E) {
+                portTrackSeg0EWrite(data);
+            }
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT", 0);
         } break;
         case G_MW_SEGMENT_INTERP: {
@@ -5238,6 +5779,9 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             if (segIndex == mInterpolationIndex) {
                 uintptr_t _old = mSegmentPointers[segNumber];
                 mSegmentPointers[segNumber] = data;
+                if (segNumber == 0x0E) {
+                    portTrackSeg0EWrite(data);
+                }
                 diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT_INTERP", 0);
             }
         } break;
@@ -5430,7 +5974,12 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     // has its bytes reversed, swapping the two pixels in the word AND each
     // pixel's byte order).  Apply BSWAP32 to restore N64 BE order before
     // copying into palette_staging.  Idempotent.
-    portRelocFixupTextureAtRuntime(src, byteCount);
+    src = static_cast<const uint8_t*>(portRelocDecodeTextureForRuntime(src, byteCount));
+    if (src == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadTlut: texture decode failed for {} bytes at {}", byteCount,
+                     (const void*)mRdp->texture_to_load.addr);
+        return;
+    }
 
     if (tmem >= 256) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
@@ -5538,7 +6087,13 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     // reversed each u32 word.  This call applies BSWAP32 again idempotently
     // the first time a texture is loaded.  Catches runtime-built fighter
     // material loadblocks that pass2 and the chain walk both miss.
-    portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr, orig_size_bytes);
+    const uint8_t* decoded_texture = static_cast<const uint8_t*>(
+        portRelocDecodeTextureForRuntime(mRdp->texture_to_load.addr, orig_size_bytes));
+    if (decoded_texture == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadBlock: texture decode failed for {} bytes at {}", orig_size_bytes,
+                     (const void*)mRdp->texture_to_load.addr);
+        return;
+    }
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
@@ -5574,7 +6129,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     // assert(size_bytes <= 4096 && "bug: too big texture");
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = decoded_texture;
     // fprintf(stderr, "GfxDpLoadBlock: line_size = 0x%x; orig = 0x%x; bpp=%d; lrs=%d\n", size_bytes,
     // orig_size_bytes,
     //         mRdp->texture_to_load.siz, lrs);
@@ -5657,8 +6212,14 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     // would stay in pass1-swapped (LE) state, rendering a byte-reversed
     // opaque strip at the bottom of the tile (Yoster "thin line" bug).
     // Fixup is idempotent so over-covering by one stride row is harmless.
-    portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr,
-                                   start_offset_bytes + tile_height * full_image_line_size_bytes);
+    const uint32_t decode_span = start_offset_bytes + tile_height * full_image_line_size_bytes;
+    const uint8_t* decoded_texture = static_cast<const uint8_t*>(
+        portRelocDecodeTextureForRuntime(mRdp->texture_to_load.addr, decode_span));
+    if (decoded_texture == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadTile: texture decode failed for {} bytes at {}", decode_span,
+                     (const void*)mRdp->texture_to_load.addr);
+        return;
+    }
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
@@ -5668,7 +6229,7 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     //    assert(size_bytes <= 4096 && "bug: too big texture");
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr + start_offset_bytes;
+    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = decoded_texture + start_offset_bytes;
 
     const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
@@ -6355,16 +6916,25 @@ void* Interpreter::SegAddr(uintptr_t w1) {
 void GfxExecStack::start(F3DGfx* dlist) {
     while (!cmd_stack.empty())
         cmd_stack.pop();
+    portResetSeg0ERuntimeScope();
     gfx_path.clear();
     F3DGfx* normalized = portNormalizeDisplayListPointer(dlist);
     diagRecordDLPush(nullptr, dlist, normalized, "ExecStack::start");
-    cmd_stack.push(normalized);
+    if (normalized != nullptr) {
+        cmd_stack.push(normalized);
+    }
+#ifdef __vita__
+    else {
+        port_log("SSB64: GFX_TASK_PREFLIGHT_ABORT root=%p action=drop-task-before-execution\n", dlist);
+    }
+#endif
     disp_stack.clear();
 }
 
 void GfxExecStack::stop() {
     while (!cmd_stack.empty())
         cmd_stack.pop();
+    portResetSeg0ERuntimeScope();
     gfx_path.clear();
 }
 
@@ -6388,6 +6958,13 @@ void GfxExecStack::branch(F3DGfx* caller) {
     cmd_stack.push(nullptr);
     F3DGfx* normalized = portNormalizeDisplayListPointer(old);
     diagRecordDLPush(caller, old, normalized, "ExecStack::branch");
+    if (normalized == nullptr) {
+#ifdef __vita__
+        port_log("SSB64: GFX_TASK_PREFLIGHT_ABORT caller=%p branch=%p action=abort-task\n", caller, old);
+#endif
+        stop();
+        return;
+    }
     cmd_stack.push(normalized);
 
     gfx_path.push_back(caller);
@@ -6396,6 +6973,13 @@ void GfxExecStack::branch(F3DGfx* caller) {
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
     F3DGfx* normalized = portNormalizeDisplayListPointer(callee);
     diagRecordDLPush(caller, callee, normalized, "ExecStack::call");
+    if (normalized == nullptr) {
+#ifdef __vita__
+        port_log("SSB64: GFX_TASK_PREFLIGHT_ABORT caller=%p callee=%p action=abort-task\n", caller, callee);
+#endif
+        stop();
+        return;
+    }
     cmd_stack.push(normalized);
     gfx_path.push_back(caller);
 }
@@ -6925,6 +7509,9 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = gInstance;
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+    const bool portIsSegment0ECall = cmd->words.w1 <= UINT32_MAX &&
+        ((cmd->words.w1 >> 24) & 0xFFu) == 0x0Eu;
+    const bool portRuntimeSeg0EScope = portSeg0ERuntimeScopeForDL(portIsSegment0ECall);
 
     /* A stale tagged reloc token resolves to NULL in SegAddr. Do not let a
      * no-push G_DL branch install that NULL as the next command pointer. */
@@ -6938,7 +7525,8 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                      (uint32_t)cmd->words.w1);
         }
 #endif
-        return false;
+        g_exec_stack.stop();
+        return true;
     }
 
     // PORT: Resolve ambiguous segment-0x0E G_DL commands using the resource
@@ -6946,12 +7534,14 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     // widened vector, so portRelocFindContainingFile(cmd) cannot recover the
     // originating file.  The packed-DL cache can.
     //
-    // Prefer a demonstrably-valid intra-file packed DL.  Only use the runtime
-    // segment-E material buffer when the same-file candidate is not a valid DL.
-    // This preserves legitimate per-MObj runtime sub-DLs while preventing a
-    // populated segment E from hijacking model/stage branches.
+    // A target proven by the post-reloc manifest to be an owner-local G_DL
+    // child is authoritative over a stale segment-E binding. A fresh runtime
+    // binding scoped to the model call that immediately follows its segment
+    // write remains authoritative instead: that is the per-DObj material DL.
+    // This execution provenance also handles resources where palette bytes at
+    // the same offset accidentally pass structural DL validation.
     bool portSeg0EInFileResolved = false;
-    if (cmd->words.w1 <= UINT32_MAX && ((cmd->words.w1 >> 24) & 0xFFu) == 0x0Eu) {
+    if (portIsSegment0ECall) {
         const PortPackedDisplayListInfo* callerInfo = nullptr;
         size_t callerIndex = 0;
         if (portFindNormalizedDisplayListCommand(cmd, &callerInfo, &callerIndex) && callerInfo != nullptr) {
@@ -6963,32 +7553,21 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
             const char* resourcePath = nullptr;
             portRelocDescribePointer(callerInfo->source, &resourceBase, &resourceSize, &fileId, &resourcePath);
 
-            // MVCommon begins with palettes/raw data; its first real Gfx array
-            // is dMVCommon_DL_0x5A18. The generic bounded opcode heuristic can
-            // accidentally find an ENDDL-looking byte pattern in those palette
-            // bytes (the clean v17 hardware log repeatedly misclassified +0x8).
-            // This range is known from relocData/52_MVCommon.c, so do not allow
-            // segment-E branches into it to steal the live runtime material DL.
-            const bool knownNonDlPrefix = (fileId == 52u && offset < 0x5A18u);
-            if (knownNonDlPrefix) {
-#ifdef __vita__
-                static unsigned int sSeg0EKnownDataRejectBudget = 16;
-                if (sSeg0EKnownDataRejectBudget > 0) {
-                    --sSeg0EKnownDataRejectBudget;
-                    port_log("SSB64: SEG0E_GDL_REJECT reason=known-data-prefix file=%u path=%s caller_idx=%u off=0x%x runtime_base=%p\n",
-                             fileId, resourcePath != nullptr ? resourcePath : "(unknown)",
-                             (unsigned int)callerIndex, offset,
-                             reinterpret_cast<void*>(gfx->mSegmentPointers[0x0E]));
-                }
-#endif
-            } else if (portPackedDisplayListTargetLooksValid(callerInfo->fileBase, callerInfo->fileSize, offset)) {
+            const uintptr_t ownerTarget = callerInfo->fileBase + offset;
+            const bool typedOwnerTarget = offset < callerInfo->fileSize &&
+                portRelocIsManifestDisplayListTarget(reinterpret_cast<const void*>(ownerTarget));
+            const bool unboundStructuralFallback = gfx->mSegmentPointers[0x0E] == 0 &&
+                portPackedDisplayListTargetLooksValid(callerInfo->fileBase, callerInfo->fileSize, offset);
+
+            if (!portRuntimeSeg0EScope && (typedOwnerTarget || unboundStructuralFallback)) {
                 subGFX = reinterpret_cast<F3DGfx*>(callerInfo->fileBase + offset);
                 portSeg0EInFileResolved = true;
 #ifdef __vita__
                 static unsigned int sSeg0EInFileLogBudget = 32;
                 if (sSeg0EInFileLogBudget > 0) {
                     --sSeg0EInFileLogBudget;
-                    port_log("SSB64: SEG0E_GDL_RESOLVE mode=in-file file=%u path=%s caller_idx=%u off=0x%x target=%p runtime_base=%p\n",
+                    port_log("SSB64: SEG0E_GDL_RESOLVE mode=%s file=%u path=%s caller_idx=%u off=0x%x target=%p runtime_base=%p\n",
+                             typedOwnerTarget ? "in-file-typed" : "in-file-fallback",
                              fileId, resourcePath != nullptr ? resourcePath : "(unknown)",
                              (unsigned int)callerIndex, offset, subGFX,
                              reinterpret_cast<void*>(gfx->mSegmentPointers[0x0E]));
@@ -7042,7 +7621,8 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                         static unsigned int sSeg0ERuntimeLogBudget = 32;
                         if (sSeg0ERuntimeLogBudget > 0) {
                             --sSeg0ERuntimeLogBudget;
-                            port_log("SSB64: SEG0E_GDL_RESOLVE mode=runtime off=0x%x base=%p target=%p\n",
+                            port_log("SSB64: SEG0E_GDL_RESOLVE mode=runtime scope=%s off=0x%x base=%p target=%p\n",
+                                     portRuntimeSeg0EScope ? "material-owner" : "unscoped",
                                      n64_offset, reinterpret_cast<void*>(segBase), subGFX);
                         }
 #endif
@@ -7052,30 +7632,39 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
         }
     }
 
-    // Last-resort fallback when segment E is unset and the strict validator
-    // could not classify the target.  Recover the original reloc context from
-    // the widened-command cache; querying cmd itself is wrong because cmd is
-    // normally heap memory owned by the normalized vector.
+    // A segment-E target that is neither a proven owner-local packed DL nor
+    // backed by the live runtime segment table is unresolved.  Do not reinterpret
+    // its raw offset as an address: that executes arbitrary resource bytes and
+    // turns one invalid branch into a partially-rendered task.
     {
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
         if (!portSeg0EInFileResolved && cmd->words.w1 <= UINT32_MAX && segByte == 0x0E &&
             (uintptr_t)subGFX == cmd->words.w1) {
+#ifdef __vita__
             const PortPackedDisplayListInfo* callerInfo = nullptr;
             size_t callerIndex = 0;
+            uintptr_t ownerBase = 0;
+            size_t ownerSize = 0;
+            uint32_t ownerFileId = 0xFFFFFFFFu;
+            const char* ownerPath = nullptr;
             if (portFindNormalizedDisplayListCommand(cmd, &callerInfo, &callerIndex) && callerInfo != nullptr) {
-                uint32_t offset = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
-                if (offset < callerInfo->fileSize) {
-                    subGFX = (F3DGfx*)(callerInfo->fileBase + offset);
-#ifdef __vita__
-                    static unsigned int sSeg0EFallbackLogBudget = 16;
-                    if (sSeg0EFallbackLogBudget > 0) {
-                        --sSeg0EFallbackLogBudget;
-                        port_log("SSB64: SEG0E_GDL_RESOLVE mode=in-file-fallback caller_idx=%u off=0x%x target=%p\n",
-                                 (unsigned int)callerIndex, offset, subGFX);
-                    }
-#endif
-                }
+                portRelocDescribePointer(callerInfo->source, &ownerBase, &ownerSize,
+                                         &ownerFileId, &ownerPath);
             }
+            static unsigned int sSeg0EUnresolvedBudget = 32;
+            if (sSeg0EUnresolvedBudget > 0) {
+                --sSeg0EUnresolvedBudget;
+                port_log("SSB64: SEG0E_GDL_REJECT reason=unresolved file=%u path=%s caller_idx=%u "
+                         "cmd=%p w0=0x%08x w1=0x%08x off=0x%x runtime_base=%p action=abort-task\n",
+                         ownerFileId, ownerPath != nullptr ? ownerPath : "(unknown)",
+                         (unsigned int)callerIndex, cmd, (unsigned int)cmd->words.w0,
+                         (unsigned int)cmd->words.w1,
+                         (unsigned int)(cmd->words.w1 & 0x00FFFFFFu),
+                         reinterpret_cast<void*>(gfx->mSegmentPointers[0x0E]));
+            }
+#endif
+            g_exec_stack.stop();
+            return true;
         }
     }
 
@@ -7187,7 +7776,8 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                 Fast::DumpDLDiag(subGFX, "gfx_dl_handler: walked-past");
             }
 #endif
-            return false;
+            g_exec_stack.stop();
+            return true;
         }
     }
 

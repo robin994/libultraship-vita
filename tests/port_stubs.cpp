@@ -43,6 +43,16 @@ extern "C" int portRelocDecodeVerticesForRuntime(const void* /*addr*/,
     return 0;
 }
 
+extern "C" int portRelocNormalizeVerticesForTypedConsumer(const void* /*addr*/,
+                                                            unsigned int /*num_vtx*/) {
+    return 1;
+}
+
 extern "C" void portRelocFixupTextureAtRuntime(const void* /*addr*/,
                                                unsigned int /*num_bytes*/) {
+}
+
+extern "C" const void* portRelocDecodeTextureForRuntime(const void* addr,
+                                                          unsigned int /*num_bytes*/) {
+    return addr;
 }
