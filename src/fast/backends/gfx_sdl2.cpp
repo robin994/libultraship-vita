@@ -55,6 +55,12 @@ LONG_PTR SDL_WndProc;
 #include <vitasdk.h>
 extern "C" void vglSwapBuffers(GLboolean has_commondialog);
 extern "C" void port_log(const char* fmt, ...);
+#if defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+static uint32_t sVitaLastPaceUs = 0;
+static uint32_t sVitaLastSwapUs = 0;
+extern "C" uint32_t port_vita_get_last_pace_us(void) { return sVitaLastPaceUs; }
+extern "C" uint32_t port_vita_get_last_swap_us(void) { return sVitaLastSwapUs; }
+#endif
 #endif
 
 namespace Fast {
@@ -855,7 +861,14 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
 #endif
     }
 
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaPaceStartUs = sceKernelGetProcessTimeLow();
+#endif
     SyncFramerateWithTime();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaPaceUs = sceKernelGetProcessTimeLow() - vitaPaceStartUs;
+    sVitaLastPaceUs = vitaPaceUs;
+#endif
 #ifdef __vita__
     /* This build initializes and renders through vitaGL directly, while the
      * VitaSDK-bundled SDL2 is the stock sceGxm SDL_Renderer backend, not the
@@ -863,15 +876,27 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
      * present vitaGL's global display surface. End the vitaGL frame directly.
      * GL_FALSE means no Sony common-dialog overlay is active; it is not a
      * vsync flag. */
+#if (defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG) || \
+    (defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG)
+    const uint32_t swapStartUs = sceKernelGetProcessTimeLow();
+#endif
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     static uint32_t sVitaSwapCount = 0;
     sVitaSwapCount++;
     if (sVitaSwapCount <= 3) {
         port_log("SSB64: Vita swap frame=%u backend=vglSwapBuffers common_dialog=0\n",
                  (unsigned int)sVitaSwapCount);
     }
-    const uint32_t swapStartUs = sceKernelGetProcessTimeLow();
+#endif
     vglSwapBuffers(GL_FALSE);
+#if (defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG) || \
+    (defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG)
     const uint32_t swapUs = sceKernelGetProcessTimeLow() - swapStartUs;
+#endif
+#if defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    sVitaLastSwapUs = swapUs;
+#endif
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     static uint32_t sVitaSwapPerfFrames = 0;
     static uint64_t sVitaSwapPerfUsTotal = 0;
     static uint32_t sVitaSwapPerfUsMax = 0;
@@ -889,6 +914,7 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         sVitaSwapPerfUsTotal = 0;
         sVitaSwapPerfUsMax = 0;
     }
+#endif
 #else
     SDL_GL_SwapWindow(mWnd);
 #endif

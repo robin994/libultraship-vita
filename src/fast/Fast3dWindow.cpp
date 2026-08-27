@@ -15,6 +15,20 @@
 
 #include <fstream>
 
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+#include <vitasdk.h>
+static uint32_t sVitaLastGuiStartUs = 0;
+static uint32_t sVitaLastInterpreterStartUs = 0;
+static uint32_t sVitaLastInterpreterRunUs = 0;
+static uint32_t sVitaLastGuiEndUs = 0;
+static uint32_t sVitaLastInterpreterEndUs = 0;
+extern "C" uint32_t port_vita_get_last_gui_start_us(void) { return sVitaLastGuiStartUs; }
+extern "C" uint32_t port_vita_get_last_interpreter_start_us(void) { return sVitaLastInterpreterStartUs; }
+extern "C" uint32_t port_vita_get_last_interpreter_run_us(void) { return sVitaLastInterpreterRunUs; }
+extern "C" uint32_t port_vita_get_last_gui_end_us(void) { return sVitaLastGuiEndUs; }
+extern "C" uint32_t port_vita_get_last_interpreter_end_us(void) { return sVitaLastInterpreterEndUs; }
+#endif
+
 namespace Fast {
 
 extern void GfxSetInstance(std::shared_ptr<Interpreter> gfx);
@@ -218,13 +232,35 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const robin_hood::u
     }
 
     auto gui = wnd->GetGui();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaGuiStartBeginUs = sceKernelGetProcessTimeLow();
+#endif
     wnd->GetMouseStateManager()->StartFrame();
     gui->StartDraw();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaInterpreterStartBeginUs = sceKernelGetProcessTimeLow();
+    sVitaLastGuiStartUs = vitaInterpreterStartBeginUs - vitaGuiStartBeginUs;
+#endif
     mInterpreter->StartFrame();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaRunBeginUs = sceKernelGetProcessTimeLow();
+    sVitaLastInterpreterStartUs = vitaRunBeginUs - vitaInterpreterStartBeginUs;
+#endif
     // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaGuiEndBeginUs = sceKernelGetProcessTimeLow();
+    sVitaLastInterpreterRunUs = vitaGuiEndBeginUs - vitaRunBeginUs;
+#endif
     gui->EndDraw();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    const uint32_t vitaInterpreterEndBeginUs = sceKernelGetProcessTimeLow();
+    sVitaLastGuiEndUs = vitaInterpreterEndBeginUs - vitaGuiEndBeginUs;
+#endif
     mInterpreter->EndFrame();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    sVitaLastInterpreterEndUs = sceKernelGetProcessTimeLow() - vitaInterpreterEndBeginUs;
+#endif
 
     return true;
 }

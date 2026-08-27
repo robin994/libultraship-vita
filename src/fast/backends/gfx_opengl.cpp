@@ -34,6 +34,12 @@
 #include "stb_image_write.h"
 
 #ifdef __vita__
+#if (defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG) || \
+    (defined(SSB64_VITA_SCENE_DIAG) && SSB64_VITA_SCENE_DIAG)
+#define SSB64_VITA_RENDER_DIAG_ENABLED 1
+#else
+#define SSB64_VITA_RENDER_DIAG_ENABLED 0
+#endif
 #include <psp2/gxm.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
@@ -1140,17 +1146,19 @@ static void GLDumpDrawSnapshot();
 static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats);
 
 #ifdef __vita__
+#if SSB64_VITA_RENDER_DIAG_ENABLED
 static uint32_t sVitaVboFrameBytes = 0;
 static uint32_t sVitaVboFrameDraws = 0;
 static uint32_t sVitaVboFrameTris = 0;
 static uint32_t sVitaDrawApiFrameUs = 0;
 static uint32_t sVitaGlDrawFrameUs = 0;
 static uint32_t sVitaVboPeakBytes = 0;
+#endif
 static uint32_t sVitaVboDroppedDraws = 0;
 #endif
 
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-#ifdef __vita__
+#if defined(__vita__) && SSB64_VITA_RENDER_DIAG_ENABLED
     const uint32_t vitaDrawApiStartUs = sceKernelGetProcessTimeLow();
 #endif
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
@@ -1222,20 +1230,22 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     }
     memcpy(vita_vbo, buf_vbo, vbo_bytes);
     vglBufferData(GL_ARRAY_BUFFER, vita_vbo);
+#if SSB64_VITA_RENDER_DIAG_ENABLED
     sVitaVboFrameBytes += (uint32_t)vbo_bytes;
     sVitaVboFrameDraws++;
     sVitaVboFrameTris += (uint32_t)buf_vbo_num_tris;
     if (sVitaVboFrameBytes > sVitaVboPeakBytes) {
         sVitaVboPeakBytes = sVitaVboFrameBytes;
     }
+#endif
 #else
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
 #endif
-#ifdef __vita__
+#if defined(__vita__) && SSB64_VITA_RENDER_DIAG_ENABLED
     const uint32_t vitaGlDrawStartUs = sceKernelGetProcessTimeLow();
 #endif
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
-#ifdef __vita__
+#if defined(__vita__) && SSB64_VITA_RENDER_DIAG_ENABLED
     const uint32_t vitaDrawEndUs = sceKernelGetProcessTimeLow();
     sVitaGlDrawFrameUs += vitaDrawEndUs - vitaGlDrawStartUs;
     sVitaDrawApiFrameUs += vitaDrawEndUs - vitaDrawApiStartUs;
@@ -1354,6 +1364,8 @@ void GfxRenderingAPIOGL::EndFrame() {
 #ifndef __vita__
     glFlush();
 #else
+#if SSB64_VITA_RENDER_DIAG_ENABLED
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     static uint32_t sVitaRenderFrames = 0;
     static uint64_t sVitaRenderDraws = 0;
     static uint64_t sVitaRenderTris = 0;
@@ -1361,6 +1373,8 @@ void GfxRenderingAPIOGL::EndFrame() {
     static uint64_t sVitaRenderApiUs = 0;
     static uint64_t sVitaRenderGlDrawUs = 0;
     static uint32_t sVitaRenderApiFrameMaxUs = 0;
+#endif
+#if defined(SSB64_VITA_SCENE_DIAG) && SSB64_VITA_SCENE_DIAG
     static uint8_t sVitaDiagScene = UINT8_MAX;
     static uint8_t sVitaDiagStage = UINT8_MAX;
     static uint32_t sVitaDiagTaskFrame = UINT32_MAX;
@@ -1390,7 +1404,9 @@ void GfxRenderingAPIOGL::EndFrame() {
         sVitaDiagStage = vitaDiagStage;
         sVitaDiagTaskFrame = vitaDiagTaskFrame;
     }
+#endif
 
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     if (mFrameCount <= 3) {
         port_log("SSB64: Vita VBO frame=%u bytes=%u draws=%u peak=%u dropped_total=%u\n",
                  (unsigned int)mFrameCount, (unsigned int)sVitaVboFrameBytes,
@@ -1428,11 +1444,13 @@ void GfxRenderingAPIOGL::EndFrame() {
         sVitaRenderGlDrawUs = 0;
         sVitaRenderApiFrameMaxUs = 0;
     }
+#endif
     sVitaVboFrameBytes = 0;
     sVitaVboFrameDraws = 0;
     sVitaVboFrameTris = 0;
     sVitaDrawApiFrameUs = 0;
     sVitaGlDrawFrameUs = 0;
+#endif
 #endif
 }
 

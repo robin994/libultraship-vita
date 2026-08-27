@@ -8,6 +8,9 @@
 #include "ship/config/ConsoleVariable.h"
 #include <imgui.h>
 #include "ship/controller/controldevice/controller/mapping/mouse/WheelHandler.h"
+#ifdef __vita__
+#include "ship/controller/controldevice/controller/mapping/sdl/SDLButtonToButtonMapping.h"
+#endif
 
 namespace Ship {
 
@@ -106,6 +109,49 @@ void ControlDeck::Init(uint8_t* controllerBits) {
             mPorts[i]->GetConnectedController()->AddDefaultMappings(PhysicalDeviceType::SDLGamepad);
         }
     }
+
+#ifdef __vita__
+    /* Existing Vita installs already have HasConfig=1, so changing the
+     * platform defaults alone would leave their old L2/R2-only R/Z mappings
+     * in place forever. Apply this migration once, adding only the physical
+     * Vita bindings introduced by the fix; later user edits are respected. */
+    constexpr int32_t kVitaButtonLayoutVersion = 1;
+    const char* vitaLayoutVersionKey = CVAR_PREFIX_CONTROLLERS ".VitaButtonLayoutVersion";
+    auto cvars = Ship::Context::GetInstance()->GetConsoleVariables();
+    if (cvars->GetInteger(vitaLayoutVersionKey, 0) < kVitaButtonLayoutVersion) {
+        struct VitaButtonBinding {
+            CONTROLLERBUTTONS_T bitmask;
+            SDL_GameControllerButton button;
+        };
+        static constexpr VitaButtonBinding kVitaBindings[] = {
+            { BTN_R, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
+            { BTN_Z, SDL_CONTROLLER_BUTTON_X },
+            { BTN_CUP, SDL_CONTROLLER_BUTTON_Y },
+        };
+
+        for (auto& port : mPorts) {
+            auto controller = port->GetConnectedController();
+            if (controller == nullptr) {
+                continue;
+            }
+            for (const auto& binding : kVitaBindings) {
+                auto logicalButton = controller->GetButton(binding.bitmask);
+                if (logicalButton == nullptr) {
+                    continue;
+                }
+                auto mapping = std::make_shared<SDLButtonToButtonMapping>(
+                    controller->GetPortIndex(), binding.bitmask, binding.button);
+                if (logicalButton->GetButtonMappingById(mapping->GetButtonMappingId()) == nullptr) {
+                    logicalButton->AddButtonMapping(mapping);
+                    mapping->SaveToConfig();
+                    logicalButton->SaveButtonMappingIdsToConfig();
+                }
+            }
+        }
+        cvars->SetInteger(vitaLayoutVersionKey, kVitaButtonLayoutVersion);
+        cvars->Save();
+    }
+#endif
 
     // Install Raphnet rumble mappings on any port the RaphnetPhysicalDeviceManager
     // has claimed. Polling (the input read path) wires up in L7 — this commit

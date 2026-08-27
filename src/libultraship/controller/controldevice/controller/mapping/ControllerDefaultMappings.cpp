@@ -75,6 +75,13 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
         { BTN_A, { SDL_CONTROLLER_BUTTON_A } },
         { BTN_B, { SDL_CONTROLLER_BUTTON_B } },
         { BTN_L, { SDL_CONTROLLER_BUTTON_LEFTSHOULDER } },
+#ifdef __vita__
+        // Vita has no L2/R2 trigger axes. Keep every N64 gameplay action
+        // reachable using the physical controls that actually exist.
+        { BTN_R, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
+        { BTN_Z, { SDL_CONTROLLER_BUTTON_X } },
+        { BTN_CUP, { SDL_CONTROLLER_BUTTON_Y } },
+#endif
         { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
         { BTN_DUP, { SDL_CONTROLLER_BUTTON_DPAD_UP } },
         { BTN_DDOWN, { SDL_CONTROLLER_BUTTON_DPAD_DOWN } },
@@ -93,8 +100,10 @@ void ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings(
     }
 
     Ship::ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings({
+#ifndef __vita__
         { BTN_R, { { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1 } } },
         { BTN_Z, { { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1 } } },
+#endif
         { BTN_CUP, { { SDL_CONTROLLER_AXIS_RIGHTY, -1 } } },
         { BTN_CDOWN, { { SDL_CONTROLLER_AXIS_RIGHTY, 1 } } },
         { BTN_CLEFT, { { SDL_CONTROLLER_AXIS_RIGHTX, -1 } } },

@@ -68,6 +68,7 @@ extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, s
                                          uint32_t* out_file_id, const char** out_path);
 extern "C" unsigned int portRelocGetLifetimeGeneration(void);
 extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
+extern "C" const void *portRelocGetDecodedVerticesForRuntime(const void *addr, unsigned int num_vtx);
 extern "C" int portRelocIsManifestDisplayListTarget(const void* ptr);
 extern "C" int portRelocDecodeVerticesForRuntime(const void *addr, unsigned int num_vtx,
                                                      void *out_vertices, size_t out_size);
@@ -75,6 +76,9 @@ extern "C" int portRelocNormalizeVerticesForTypedConsumer(const void *addr,
                                                              unsigned int num_vtx);
 extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int num_bytes);
 extern "C" const void* portRelocDecodeTextureForRuntime(const void *addr, unsigned int num_bytes);
+extern "C" int portRelocIsStableDecodedTextureRange(const void *addr, unsigned int num_bytes);
+extern "C" void port_dl_range_register(const void *base, size_t size, const char *label);
+extern "C" void port_dl_range_unregister(const void *base);
 
 /* Game-specific DL safety hooks. The embedding game (e.g. SSB64) registers
  * a bounds-check and an address classifier via the public API in
@@ -836,6 +840,12 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
     Fast::F3DGfx* translatedPtr = translated->data();
     sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
+    /* The interpreter walks this host-width copy, not the packed reloc bytes.
+     * Register the actual execution range so the per-command bounds check is
+     * both exact and lock-free after its first hit. Without this registration
+     * the vector is UNKNOWN memory and may be mistaken for a walk-past if the
+     * allocator places it near another registered range. */
+    port_dl_range_register(translatedPtr, translated->size() * sizeof(Fast::F3DGfx), "widened_dl");
 
     return translatedPtr;
 }
@@ -987,6 +997,11 @@ extern "C" int portValidateDisplayListPreflight(const void* dlist) {
 }
 
 extern "C" void portResetPackedDisplayListCache(void) {
+    for (const auto& entry : sPortPackedDisplayListCache) {
+        if (entry.second.commands && !entry.second.commands->empty()) {
+            port_dl_range_unregister(entry.second.commands->data());
+        }
+    }
     sPortPackedDisplayListCache.clear();
     sPortPackedPreflightValidCache.clear();
 }
@@ -1026,6 +1041,9 @@ extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t s
             }
         }
         if (evict) {
+            if (it->second.commands && !it->second.commands->empty()) {
+                port_dl_range_unregister(it->second.commands->data());
+            }
             it = sPortPackedDisplayListCache.erase(it);
         } else {
             ++it;
@@ -1056,6 +1074,7 @@ void vglSetParamBufferSize(uint32_t size);
 void vglSetCircularPoolSize(uint32_t size);
 void vglUseTripleBuffering(uint8_t usage);
 uint8_t vglInitWithCustomThreshold(int pool_size, int width, int height, int ram_threshold, int cdram_threshold, int phycont_threshold, int cdlg_threshold, SceGxmMultisampleMode msaa);
+void vglWaitVblankStart(uint8_t enable);
 #ifdef HAVE_TROPHIES
 int trophies_init();
 void vglSwapBuffers(uint8_t);
@@ -1077,9 +1096,10 @@ void warning(const char *msg) {
 #endif
 };
 
-/* Aggregate-only profiler. It observes the established interpreter path and
- * deliberately does not alter resource lookup, vertex conversion or VBO
- * generation. */
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
+/* Aggregate-only profiler. Keep it out of shipping builds: even cheap counters
+ * sit in the per-command/per-flush path and become measurable at 3-4k GBI
+ * commands per frame. */
 struct VitaFast3DStats {
     uint32_t frames;
     uint64_t commands;
@@ -1091,6 +1111,21 @@ struct VitaFast3DStats {
 };
 
 static VitaFast3DStats sVitaFast3DStats = {};
+#endif
+
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+/* Three integer taps only: enough to tell whether a slow frame is caused by
+ * more display-list work without re-enabling the heavyweight runtime profiler. */
+struct VitaSlowFrameWork {
+    uint32_t commands;
+    uint32_t flushes;
+    uint32_t tris;
+};
+static VitaSlowFrameWork sVitaSlowFrameWork = {};
+extern "C" uint32_t port_vita_get_last_fast3d_commands(void) { return sVitaSlowFrameWork.commands; }
+extern "C" uint32_t port_vita_get_last_fast3d_flushes(void) { return sVitaSlowFrameWork.flushes; }
+extern "C" uint32_t port_vita_get_last_fast3d_tris(void) { return sVitaSlowFrameWork.tris; }
+#endif
 
 /* v12 targeted fighter-geometry diagnostics.
  * File IDs are stable entries from the generated SSB64 reloc manifest:
@@ -1307,11 +1342,15 @@ Interpreter::Interpreter() {
      * longer justified. 8MB total gives each of the two buffers 4MB and
      * returns 24MB to the pools used as SceShaccCg allocation fallbacks. */
     vglSetCircularPoolSize(8 * 1024 * 1024);
-    /* Triple buffering costs a whole extra display framebuffer's worth of
-     * VRAM; per Rinnegatamante, dropping to double buffering is one of the
-     * standard vitaGL memory-pressure knobs on this platform. Must be set
-     * before vglInitWithCustomThreshold, which reads it during setup. */
-    vglUseTripleBuffering(0 /* GL_FALSE - not in scope here, double-buffer */);
+    /* Triple buffering costs one extra display framebuffer but prevents a
+     * narrow vblank miss from immediately stalling the CPU on the next
+     * present. The shader-memory fixes leave this independently switchable
+     * so real hardware can A/B it without touching renderer correctness. */
+#if defined(SSB64_VITA_TRIPLE_BUFFERING) && SSB64_VITA_TRIPLE_BUFFERING
+    vglUseTripleBuffering(1);
+#else
+    vglUseTripleBuffering(0);
+#endif
     /* ram_threshold is how much system RAM vitaGL LEAVES UNCLAIMED, not how
      * much it takes (see vglInitWithCustomThreshold: it claims
      * size_user - ram_threshold). The old 4MB was far more aggressive than
@@ -1331,7 +1370,11 @@ Interpreter::Interpreter() {
      * 4x here cannot be undone by the later Fast3D SetMsaaLevel(1) call and
      * needlessly multiplies render-target bandwidth on this hardware. */
     vglInitWithCustomThreshold(0, 960, 544, 32 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_NONE);
+#if defined(SSB64_VITA_TRIPLE_BUFFERING) && SSB64_VITA_TRIPLE_BUFFERING
+    port_log("SSB64: vitaGL config param=4MiB circular=8MiB display_buffers=3 "
+#else
     port_log("SSB64: vitaGL config param=4MiB circular=8MiB display_buffers=2 "
+#endif
              "ram_threshold=32MiB msaa=1x shader_cache=fast3d-program-binary\n");
     /* Baseline memory reading, before the game loads any assets - pairs with
      * the same reading logged at shader-link failure in gfx_opengl.cpp, so
@@ -1341,6 +1384,13 @@ Interpreter::Interpreter() {
              (unsigned int)vglMemFree(VGL_MEM_VRAM), (unsigned int)vglMemFree(VGL_MEM_RAM),
              (unsigned int)vglMemFree(VGL_MEM_SLOW), (unsigned int)vglMemFree(VGL_MEM_BUDGET),
              (unsigned int)vglMemFree(VGL_MEM_EXTERNAL));
+#if defined(SSB64_VITA_DISABLE_VSYNC) && SSB64_VITA_DISABLE_VSYNC
+    /* Frame-rate experiment: skip gxm.c's sceDisplayWaitVblankStartMulti()
+     * wait entirely (vsync_interval -> 0). Uncapped present rate — a
+     * frame-pacing/tearing test, not a shipped default. */
+    vglWaitVblankStart(0);
+    port_log("SSB64: vitaGL vsync=disabled (SSB64_VITA_DISABLE_VSYNC build)\n");
+#endif
 #endif
     /* This is CPU staging for one Fast3D batch, not storage submitted
      * directly to GXM. The Vita GL backend copies only the populated bytes
@@ -1530,14 +1580,27 @@ extern "C" void gbi_trace_note_flush(int num_tris);
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
         sVitaFast3DStats.flushes++;
+#endif
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+        sVitaSlowFrameWork.flushes++;
+        sVitaSlowFrameWork.tris += mBufVboNumTris;
 #endif
         //mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         // Emit a marker into the GBI trace so draw-dump indices can be
         // correlated with positions in the traced command stream.
+#ifdef __vita__
+        /* Normal Vita gameplay detaches the GBI trace/RCP callback. Avoid a
+         * cross-TU trace marker call for every tiny material batch; cutscene
+         * cost simulation and explicit trace captures keep the marker. */
+        if (sGbiTraceCallback != nullptr) {
+            gbi_trace_note_flush((int)mBufVboNumTris);
+        }
+#else
         gbi_trace_note_flush((int)mBufVboNumTris);
+#endif
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -2005,6 +2068,7 @@ extern "C" void portQueryGLDepthState(int* depth_test, int* depth_func, int* dep
 // first M TEXRECT can show whether some 3D-only state (a stale combine
 // mode, othermode, or tile setup from the previous 3D draw) leaked into the
 // 2D pass instead of being reset.
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
 #define VITA_CMD_HISTORY_SIZE 24
 struct VitaCmdHistoryEntry {
     uint8_t opcode;
@@ -2014,6 +2078,7 @@ struct VitaCmdHistoryEntry {
 static VitaCmdHistoryEntry sVitaCmdHistory[VITA_CMD_HISTORY_SIZE];
 static int sVitaCmdHistoryPos = 0;
 static uint32_t sVitaCmdHistoryTotal = 0;
+#endif
 
 // Self-contained opcode->name lookup (F3DEX2 values only — the only ucode
 // this build uses, per ucode_handler_index's fixed ucode_f3dex2 default) so
@@ -2235,6 +2300,12 @@ static void WalkCastleDLFingerprint(F3DGfx* dl, VitaCastleDLFingerprint* fp, int
 // interpreter, no CASTLE_RUNTIME_DOBJ line appears for it at all — that
 // absence is itself a finding (registered but never executed).
 extern "C" void portArmCastleGpuStateCapture(const void* gobj, const void* dobj, const void* root_dl) {
+#if defined(__vita__) && defined(SSB64_VITA_SCENE_DIAG) && !SSB64_VITA_SCENE_DIAG
+    (void)gobj;
+    (void)dobj;
+    (void)root_dl;
+    return;
+#else
     if (root_dl == nullptr || sVitaCastleTrackedCount >= VITA_CASTLE_TRACKED_MAX) {
         return;
     }
@@ -2259,6 +2330,7 @@ extern "C" void portArmCastleGpuStateCapture(const void* gobj, const void* dobj,
     entry->tri1_count = fp.tri1_count;
     entry->tri2_count = fp.tri2_count;
     entry->truncated = fp.truncated;
+#endif
 }
 #endif
 #endif
@@ -2311,14 +2383,18 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
 
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     sVitaTextureCacheStats.lookups++;
 #endif
     const bool verify = PortTextureCacheVerifyEnabled() && key.texture_addr != nullptr && key.size_bytes != 0;
+    const bool stableDecodedTexture = verify &&
+        portRelocIsStableDecodedTextureRange(key.texture_addr, key.size_bytes) != 0;
     uint64_t content_hash = 0;
     if (verify) {
         content_hash = 1469598103934665603ULL;
-        content_hash = PortTextureContentHashAppend(content_hash, key.texture_addr, key.size_bytes);
+        if (!stableDecodedTexture) {
+            content_hash = PortTextureContentHashAppend(content_hash, key.texture_addr, key.size_bytes);
+        }
         uint32_t palette_hash_bytes = 0;
 
         // CI decode bakes the current TLUT into the uploaded RGBA texture.
@@ -2344,8 +2420,8 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
                 }
             }
         }
-#ifdef __vita__
-        sVitaTextureCacheStats.hash_bytes += key.size_bytes + palette_hash_bytes;
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
+        sVitaTextureCacheStats.hash_bytes += (stableDecodedTexture ? 0u : key.size_bytes) + palette_hash_bytes;
         sVitaTextureCacheStats.palette_hash_bytes += palette_hash_bytes;
 #endif
     }
@@ -2356,7 +2432,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
             // Evict and fall through to the miss path so the caller
             // re-imports the current contents.
             static int sStaleLogCount = 0;
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
             sVitaTextureCacheStats.stale++;
 #endif
             if (sStaleLogCount < 64) {
@@ -2374,7 +2450,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
             mTextureCache.map.erase(it);
             it = mTextureCache.map.end();
         } else {
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
             sVitaTextureCacheStats.hits++;
 #endif
             mRapi->SelectTexture(i, it->second.texture_id);
@@ -2385,7 +2461,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         }
     }
 
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     sVitaTextureCacheStats.misses++;
 #endif
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
@@ -2398,7 +2474,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         }
         mTextureCache.map.erase(it);
         mTextureCache.lru.pop_front();
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
         sVitaTextureCacheStats.evictions++;
 #endif
     }
@@ -2407,12 +2483,12 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     if (!mTextureCache.free_texture_ids.empty()) {
         texture_id = mTextureCache.free_texture_ids.back();
         mTextureCache.free_texture_ids.pop_back();
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
         sVitaTextureCacheStats.reused_texture_ids++;
 #endif
     } else {
         texture_id = mRapi->NewTexture();
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
         sVitaTextureCacheStats.new_texture_ids++;
 #endif
     }
@@ -2801,7 +2877,7 @@ static void Ssb64RenderDiagLogUpload(const char* decoder, const RawTexMetadata* 
                 height);
 }
 
-#ifdef __vita__
+#if defined(__vita__) && (!defined(SSB64_VITA_SCENE_DIAG) || SSB64_VITA_SCENE_DIAG)
 static void Ssb64VitaLogDecodedUpload(const char* decoder, const RawTexMetadata* metadata, const void* addr,
                                      int tile, uint32_t width, uint32_t height, const uint8_t* rgba) {
     (void)metadata;
@@ -4256,7 +4332,7 @@ float Interpreter::AdjXForAspectRatio(float x) const {
     if (mFbActive) {
         return x;
     }
-    return x * GetWidescreenClipXScale();
+    return x * mCachedWidescreenClipXScale;
 }
 
 // Scale the width and height value based on the ratio of the viewport to the native size
@@ -4296,10 +4372,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
     const F3DVtx* vertex_source = vertices;
 #ifdef __vita__
-    F3DVtx decoded_vertices[MAX_VERTICES];
-    const int decode_result = portRelocDecodeVerticesForRuntime(
-        (const void*)vertices, (unsigned int)n_vertices, decoded_vertices, sizeof(decoded_vertices));
-    if (decode_result < 0) {
+    const void* decoded_source =
+        portRelocGetDecodedVerticesForRuntime((const void*)vertices, (unsigned int)n_vertices);
+    if (decoded_source == nullptr) {
         static unsigned int sVitaVertexDecodeRejects = 0;
         if (sVitaVertexDecodeRejects < 32u) {
             port_log("SSB64: VTX_COMMON_REJECT reason=decode-failed src=%p n=%lu dest=%lu count=%u\n",
@@ -4309,16 +4384,14 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         ++sVitaVertexDecodeRejects;
         return;
     }
-    if (decode_result > 0) {
-        vertex_source = decoded_vertices;
-    }
+    vertex_source = static_cast<const F3DVtx*>(decoded_source);
 #else
     // Desktop/non-Vita keeps the legacy in-place idempotent path because its
     // reloc pass2 may already have normalized some vertex ranges.
     portRelocFixupVertexAtRuntime((const void*)vertices, (unsigned int)n_vertices);
 #endif
 
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     {
         static bool sLoggedCommonVertexFixup = false;
         static unsigned int sVitaCommonVertexTrace = 0;
@@ -5071,6 +5144,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                          (double)mRdp->scissor.y, (double)mRdp->scissor.width, (double)mRdp->scissor.height,
                          (unsigned)mRsp->modelview_matrix_stack_size);
 
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
                 uint32_t hist_n = sVitaCmdHistoryTotal < VITA_CMD_HISTORY_SIZE ? sVitaCmdHistoryTotal
                                                                                : VITA_CMD_HISTORY_SIZE;
                 for (uint32_t hi = 0; hi < hist_n; hi++) {
@@ -5081,6 +5155,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     port_log("SSB64: CMD_HISTORY letter=%c order=%u opcode=%s w0=0x%016llx w1=0x%016llx\n", letter,
                              hi, VitaOpcodeName(h->opcode), (unsigned long long)h->w0, (unsigned long long)h->w1);
                 }
+#endif
             }
         }
         sVitaMarioPendingLetter = 0;
@@ -5095,10 +5170,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     uint8_t numInputs;
     bool usedTextures[2];
-
     mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
 
-    struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
+    const struct GfxClipParameters& clip_parameters = mCachedClipParameters;
 
     // PORT: G_ZS_PRIM source overrides per-vertex Z with the constant Z set by
     // gDPSetPrimDepth. SSB64 (and many other N64 titles) use this to place 2D
@@ -5128,6 +5202,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         prim_depth_ndc = prim_depth_ndc * 2.0f - 1.0f; // OpenGL [-1,1]
     }
 
+#if !defined(__vita__) || \
+    (defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG) || \
+    (defined(SSB64_VITA_SCENE_DIAG) && SSB64_VITA_SCENE_DIAG)
+    /* Diagnostic-only UV range analysis. In Vita release builds this used to
+     * execute all of its per-triangle divides/min/max work before discovering
+     * that SSB64_RENDER_DIAG was disabled. */
     for (int t = 0; t < 2; t++) {
         if (!usedTextures[t] || tex_width[t] == 0 || tex_height[t] == 0) {
             continue;
@@ -5207,6 +5287,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                                v_arr[1]->y, v_arr[1]->z, v_arr[1]->w, v_arr[2]->x, v_arr[2]->y, v_arr[2]->z,
                                v_arr[2]->w);
     }
+#endif
 
     // Accumulate this triangle's screen coverage for the port's RCP cost
     // model (see gfx_get_frame_tri_area_px). The RDP's per-pixel cost is
@@ -5215,7 +5296,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // authors exploit exactly that (huge climax flash polys) to stall the
     // RDP for several VIs. Area computed in native-resolution pixels from
     // the projected NDC positions so it is window-size independent.
-    {
+    if (sGbiTraceCallback != nullptr) {
         float sx[3], sy[3];
         bool valid = true;
         for (int i = 0; i < 3; i++) {
@@ -7562,7 +7643,7 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
             if (!portRuntimeSeg0EScope && (typedOwnerTarget || unboundStructuralFallback)) {
                 subGFX = reinterpret_cast<F3DGfx*>(callerInfo->fileBase + offset);
                 portSeg0EInFileResolved = true;
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
                 static unsigned int sSeg0EInFileLogBudget = 32;
                 if (sSeg0EInFileLogBudget > 0) {
                     --sSeg0EInFileLogBudget;
@@ -7617,7 +7698,7 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                     if ((n64_offset & 7u) == 0u) {
                         uint32_t cmd_index = n64_offset / PORT_PACKED_GFX_SIZE;
                         subGFX = (F3DGfx*)(segBase + cmd_index * sizeof(F3DGfx));
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
                         static unsigned int sSeg0ERuntimeLogBudget = 32;
                         if (sSeg0ERuntimeLogBudget > 0) {
                             --sSeg0ERuntimeLogBudget;
@@ -8877,8 +8958,11 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 }
 
 static void gfx_step() {
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     sVitaFast3DStats.commands++;
+#endif
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    sVitaSlowFrameWork.commands++;
 #endif
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
@@ -8908,6 +8992,10 @@ static void gfx_step() {
             static int sCount = 0;
             if (sCount < 10) {
                 sCount++;
+#ifdef __vita__
+                port_log("SSB64: DL_WALK_PAST cmd=%p action=stop-entire-walk count=%d\n",
+                         (void*)cmd, sCount);
+#endif
                 SPDLOG_WARN("gfx_step: cmd 0x{:x} walked past registered DL range "
                             "— stopping entire walk (likely missing gsSPEndDisplayList "
                             "in a game-built DL; parent frames may also be in garbage)",
@@ -8931,7 +9019,7 @@ static void gfx_step() {
 
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     sVitaCmdHistory[sVitaCmdHistoryPos] = { (uint8_t)opcode, (uint64_t)cmd->words.w0, (uint64_t)cmd->words.w1 };
     sVitaCmdHistoryPos = (sVitaCmdHistoryPos + 1) % VITA_CMD_HISTORY_SIZE;
     sVitaCmdHistoryTotal++;
@@ -9183,6 +9271,11 @@ void Interpreter::SetForceRenderToFb(bool force) {
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
+    /* Backend clip conventions and the Vita widescreen scale are frame-level
+     * constants. They used to be recomputed through virtual calls / floating
+     * divisions for every triangle or vertex. */
+    mCachedClipParameters = mRapi->GetClipParameters();
+    mCachedWidescreenClipXScale = GetWidescreenClipXScale();
     // Reconcile post-process state from CVars before the FBO-size
     // decisions below, since a fresh shader load flips
     // mPostProcessChain.IsActive() true and forces mRendersToFb.
@@ -9344,12 +9437,15 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>& mtx_replacements) {
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     const uint32_t vitaRunStartUs = sceKernelGetProcessTimeLow();
     uint32_t vitaMaxDLDepth = 0;
     uint32_t vitaMaxMtxDepth = 0;
 #endif
     SpReset();
+#if defined(__vita__) && defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
+    sVitaSlowFrameWork = {};
+#endif
     mFrameTriAreaPx = 0.0f;
 
     mGetPixelDepthPending.clear();
@@ -9386,13 +9482,13 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
     mRenderingState.scissor = {};
 
     auto dbg = Ship::Context::GetInstance()->GetGfxDebugger();
+    const bool debugging = dbg->IsDebugging();
     g_exec_stack.start((F3DGfx*)commands);
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     const uint32_t vitaWalkStartUs = sceKernelGetProcessTimeLow();
 #endif
     while (!g_exec_stack.cmd_stack.empty()) {
-        auto cmd = g_exec_stack.cmd_stack.top();
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
         if (g_exec_stack.cmd_stack.size() > vitaMaxDLDepth) {
             vitaMaxDLDepth = (uint32_t)g_exec_stack.cmd_stack.size();
         }
@@ -9401,7 +9497,8 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
         }
 #endif
 
-        if (dbg->IsDebugging()) {
+        if (debugging) {
+            auto cmd = g_exec_stack.cmd_stack.top();
             g_exec_stack.gfx_path.push_back(cmd);
             if (dbg->HasBreakPoint(g_exec_stack.gfx_path)) {
                 if (mFbActive) {
@@ -9415,7 +9512,7 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
         }
         gfx_step();
     }
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     const uint32_t vitaWalkUs = sceKernelGetProcessTimeLow() - vitaWalkStartUs;
 #endif
 
@@ -9444,7 +9541,7 @@ void Interpreter::Run(Gfx* commands, const robin_hood::unordered_map<Mtx*, MtxF>
         assert(0 && "active framebuffer was never reset back to original");
     }
 
-#ifdef __vita__
+#if defined(__vita__) && defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     {
         const uint32_t finalMtxDepth = (uint32_t)mRsp->modelview_matrix_stack_size;
         static unsigned int sTaskBoundsBudget = 64;
@@ -9681,6 +9778,7 @@ void Interpreter::EndFrame() {
                  mTight4_3ScissorWindow ? "yes" : "no",
                  mWidescreenFramebufferPersistence ? "yes" : "no");
     }
+#if defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG
     sVitaTextureCacheStats.frames++;
     if (sVitaTextureCacheStats.frames >= 300) {
         port_log("SSB64: DLREJECT total=%llu\n", (unsigned long long)sVitaDLRejectTotal);
@@ -9693,6 +9791,7 @@ void Interpreter::EndFrame() {
                  sVitaTextureCacheStats.palette_hash_bytes / 1024U);
         sVitaTextureCacheStats = {};
     }
+#endif
 #endif
 }
 

@@ -628,6 +628,7 @@ class Interpreter {
     size_t mBufVboNumTris{};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
+    GfxClipParameters mCachedClipParameters{};
 
     uintptr_t mSegmentPointers[MAX_SEGMENT_POINTERS]{};
 
@@ -643,6 +644,7 @@ class Interpreter {
     bool mForceRenderToFb{};
     // SSB64 port widescreen toggle — see SetWidescreenActive() doc.
     bool mWidescreenActive{};
+    float mCachedWidescreenClipXScale{1.0f};
     bool mTight4_3ScissorWindow{};
     bool mWidescreenFramebufferPersistence{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
