@@ -147,6 +147,9 @@ constexpr int16_t ShaderIdUnmask(int id) {
 struct GfxExecStack {
     // This is a dlist stack used to handle dlist calls.
     std::stack<F3DGfx*> cmd_stack = {};
+    // Exclusive end address of the registered allocation backing each DL
+    // stack frame. 0 means the source is unregistered/unknown.
+    std::stack<uintptr_t> bounds_end_stack = {};
     // This is also a dlist stack but a std::vector is used to make it possible
     // to iterate on the elements.
     // The purpose of this is to identify an instruction at a poin in time
@@ -163,6 +166,7 @@ struct GfxExecStack {
     void start(F3DGfx* dlist);
     void stop();
     F3DGfx*& currCmd();
+    uintptr_t currBoundsEnd() const;
     void openDisp(const char* file, int line);
     void closeDisp();
     const std::vector<CodeDisp>& getDisp() const;
@@ -253,6 +257,7 @@ struct RGBA {
 
 struct LoadedVertex {
     float x, y, z, w;
+    float projected_x, projected_y;
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
@@ -729,6 +734,11 @@ const char* GfxGetOpcodeName(int8_t opcode);
  *   Returns 2 (WALKED_PAST) — addr is just past a registered range; reject. */
 using DLBoundsCheckFn = int (*)(uintptr_t addr);
 void RegisterDLBoundsCheck(DLBoundsCheckFn fn);
+
+/* Resolve an in-range DL pointer to the exclusive end of its backing
+ * allocation. Called once per DL push; returns 0 for unknown pointers. */
+using DLBoundsResolveFn = uintptr_t (*)(uintptr_t addr);
+void RegisterDLBoundsResolve(DLBoundsResolveFn fn);
 
 /* Address classifier for diag dumps. Writes a human-readable label
  * (e.g. "scene_arena+0x4528") into buf. Returns nonzero if classified. */

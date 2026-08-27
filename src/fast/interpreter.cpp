@@ -87,6 +87,7 @@ extern "C" void port_dl_range_unregister(const void *base);
  * Default behavior with no callbacks registered is identical to the
  * un-hooked walker. */
 static Fast::DLBoundsCheckFn sDLBoundsCheck = nullptr;
+static Fast::DLBoundsResolveFn sDLBoundsResolve = nullptr;
 static Fast::AddressClassifierFn sAddressClassifier = nullptr;
 
 /* Return-code constants matching public API documentation. */
@@ -155,6 +156,36 @@ struct PortPackedPreflightInfo {
 
 std::unordered_map<const void*, PortPackedDisplayListInfo> sPortPackedDisplayListCache;
 std::unordered_map<const void*, PortPackedPreflightInfo> sPortPackedPreflightValidCache;
+
+/* Vita spends measurable time in libstdc++'s prime-bucket modulo for the
+ * unordered_map lookup above. Display-list calls have very strong temporal
+ * locality, so keep a tiny direct-mapped front cache. Any range eviction
+ * clears it before translated vectors can be destroyed. */
+struct PortPackedDLHotEntry {
+    const void* source = nullptr;
+    Fast::F3DGfx* translated = nullptr;
+};
+constexpr size_t PORT_PACKED_DL_HOT_COUNT = 64;
+PortPackedDLHotEntry sPortPackedDLHot[PORT_PACKED_DL_HOT_COUNT] = {};
+
+static inline size_t portPackedDLHotIndex(const void* source) {
+    return (reinterpret_cast<uintptr_t>(source) >> 3) & (PORT_PACKED_DL_HOT_COUNT - 1);
+}
+
+static inline void portPackedDLHotStore(const void* source, Fast::F3DGfx* translated) {
+    sPortPackedDLHot[portPackedDLHotIndex(source)] = { source, translated };
+}
+
+static inline Fast::F3DGfx* portPackedDLHotLookup(const void* source) {
+    const PortPackedDLHotEntry& e = sPortPackedDLHot[portPackedDLHotIndex(source)];
+    return e.source == source ? e.translated : nullptr;
+}
+
+static void portPackedDLHotClear() {
+    for (PortPackedDLHotEntry& e : sPortPackedDLHot) {
+        e = {};
+    }
+}
 
 /*
  * Segment 0x0E is overloaded by SSB64: stored model DLs use it both for
@@ -706,10 +737,30 @@ static bool portPackedDisplayListPreflightInternal(const void* root, PortPackedP
 }
 
 Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
+    if (dlist == nullptr) {
+        return nullptr;
+    }
+
+    /* A translated-cache hit is already structurally validated. Its lifetime
+     * is tied to portPackedDisplayListCacheDeleteRange(), which evicts both
+     * source overlaps and translated commands referencing an overwritten
+     * dependency range. Do not redo packed preflight and vertex
+     * normalization on every G_DL call. */
+    if (Fast::F3DGfx* hot = portPackedDLHotLookup(dlist); hot != nullptr) {
+        return hot;
+    }
+
+    auto cached = sPortPackedDisplayListCache.find(dlist);
+    if (cached != sPortPackedDisplayListCache.end()) {
+        Fast::F3DGfx* translated = cached->second.commands->data();
+        portPackedDLHotStore(dlist, translated);
+        return translated;
+    }
+
     uintptr_t fileBase = 0;
     size_t fileSize = 0;
 
-    if (dlist == nullptr || !portRelocFindContainingFile(dlist, &fileBase, &fileSize)) {
+    if (!portRelocFindContainingFile(dlist, &fileBase, &fileSize)) {
         return dlist;
     }
 
@@ -764,12 +815,6 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
         (void)probe;
         (void)rawAddr_chk;
         (void)fileEnd_chk;
-    }
-
-    auto cached = sPortPackedDisplayListCache.find(dlist);
-
-    if (cached != sPortPackedDisplayListCache.end()) {
-        return cached->second.commands->data();
     }
 
     uintptr_t rawAddr = reinterpret_cast<uintptr_t>(dlist);
@@ -846,6 +891,7 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
      * the vector is UNKNOWN memory and may be mistaken for a walk-past if the
      * allocator places it near another registered range. */
     port_dl_range_register(translatedPtr, translated->size() * sizeof(Fast::F3DGfx), "widened_dl");
+    portPackedDLHotStore(dlist, translatedPtr);
 
     return translatedPtr;
 }
@@ -997,6 +1043,7 @@ extern "C" int portValidateDisplayListPreflight(const void* dlist) {
 }
 
 extern "C" void portResetPackedDisplayListCache(void) {
+    portPackedDLHotClear();
     for (const auto& entry : sPortPackedDisplayListCache) {
         if (entry.second.commands && !entry.second.commands->empty()) {
             port_dl_range_unregister(entry.second.commands->data());
@@ -1018,6 +1065,7 @@ extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t s
     if (base == nullptr || size == 0) {
         return;
     }
+    portPackedDLHotClear();
     const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
     const uintptr_t hi = lo + size;
     for (auto it = sPortPackedPreflightValidCache.begin(); it != sPortPackedPreflightValidCache.end(); ) {
@@ -1570,6 +1618,10 @@ void DumpDLDiag(void* badCmd, const char* reason) {
 
 void RegisterDLBoundsCheck(DLBoundsCheckFn fn) {
     sDLBoundsCheck = fn;
+}
+
+void RegisterDLBoundsResolve(DLBoundsResolveFn fn) {
+    sDLBoundsResolve = fn;
 }
 
 void RegisterAddressClassifier(AddressClassifierFn fn) {
@@ -4615,6 +4667,12 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->y = y;
         d->z = z;
         d->w = w;
+        // Cache the perspective divide at vertex-load time. A vertex is
+        // commonly reused by multiple triangles, so doing these two divides
+        // once here is substantially cheaper than repeating them in every
+        // culling test while preserving the exact projected values.
+        d->projected_x = x / w;
+        d->projected_y = y / w;
 
         if (mRsp->geometry_mode & G_FOG) {
             if (fabsf(w) < 0.001f) {
@@ -4708,10 +4766,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     const uint32_t cull_back = get_attr(CULL_BACK);
 
     if ((mRsp->geometry_mode & cull_both) != 0) {
-        float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
-        float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
-        float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
-        float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
+        float dx1 = v1->projected_x - v2->projected_x;
+        float dy1 = v1->projected_y - v2->projected_y;
+        float dx2 = v3->projected_x - v2->projected_x;
+        float dy2 = v3->projected_y - v2->projected_y;
         float cross = dx1 * dy2 - dy1 * dx2;
 
         if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
@@ -6474,21 +6532,29 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     ul->y = ulyf;
     ul->z = -1.0f;
     ul->w = 1.0f;
+    ul->projected_x = ulxf;
+    ul->projected_y = ulyf;
 
     ll->x = ulxf;
     ll->y = lryf;
     ll->z = -1.0f;
     ll->w = 1.0f;
+    ll->projected_x = ulxf;
+    ll->projected_y = lryf;
 
     lr->x = lrxf;
     lr->y = lryf;
     lr->z = -1.0f;
     lr->w = 1.0f;
+    lr->projected_x = lrxf;
+    lr->projected_y = lryf;
 
     ur->x = lrxf;
     ur->y = ulyf;
     ur->z = -1.0f;
     ur->w = 1.0f;
+    ur->projected_x = lrxf;
+    ur->projected_y = ulyf;
 
     // The coordinates for texture rectangle shall bypass the viewport setting
     struct XYWidthHeight default_viewport;
@@ -6997,12 +7063,15 @@ void* Interpreter::SegAddr(uintptr_t w1) {
 void GfxExecStack::start(F3DGfx* dlist) {
     while (!cmd_stack.empty())
         cmd_stack.pop();
+    while (!bounds_end_stack.empty())
+        bounds_end_stack.pop();
     portResetSeg0ERuntimeScope();
     gfx_path.clear();
     F3DGfx* normalized = portNormalizeDisplayListPointer(dlist);
     diagRecordDLPush(nullptr, dlist, normalized, "ExecStack::start");
     if (normalized != nullptr) {
         cmd_stack.push(normalized);
+        bounds_end_stack.push(sDLBoundsResolve ? sDLBoundsResolve((uintptr_t)normalized) : 0);
     }
 #ifdef __vita__
     else {
@@ -7015,12 +7084,18 @@ void GfxExecStack::start(F3DGfx* dlist) {
 void GfxExecStack::stop() {
     while (!cmd_stack.empty())
         cmd_stack.pop();
+    while (!bounds_end_stack.empty())
+        bounds_end_stack.pop();
     portResetSeg0ERuntimeScope();
     gfx_path.clear();
 }
 
 F3DGfx*& GfxExecStack::currCmd() {
     return cmd_stack.top();
+}
+
+uintptr_t GfxExecStack::currBoundsEnd() const {
+    return bounds_end_stack.empty() ? 0 : bounds_end_stack.top();
 }
 
 void GfxExecStack::openDisp(const char* file, int line) {
@@ -7036,7 +7111,9 @@ const std::vector<GfxExecStack::CodeDisp>& GfxExecStack::getDisp() const {
 void GfxExecStack::branch(F3DGfx* caller) {
     F3DGfx* old = cmd_stack.top();
     cmd_stack.pop();
+    bounds_end_stack.pop();
     cmd_stack.push(nullptr);
+    bounds_end_stack.push(0);
     F3DGfx* normalized = portNormalizeDisplayListPointer(old);
     diagRecordDLPush(caller, old, normalized, "ExecStack::branch");
     if (normalized == nullptr) {
@@ -7047,6 +7124,7 @@ void GfxExecStack::branch(F3DGfx* caller) {
         return;
     }
     cmd_stack.push(normalized);
+    bounds_end_stack.push(sDLBoundsResolve ? sDLBoundsResolve((uintptr_t)normalized) : 0);
 
     gfx_path.push_back(caller);
 }
@@ -7062,6 +7140,7 @@ void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
         return;
     }
     cmd_stack.push(normalized);
+    bounds_end_stack.push(sDLBoundsResolve ? sDLBoundsResolve((uintptr_t)normalized) : 0);
     gfx_path.push_back(caller);
 }
 
@@ -7069,12 +7148,14 @@ F3DGfx* GfxExecStack::ret() {
     F3DGfx* cmd = cmd_stack.top();
 
     cmd_stack.pop();
+    bounds_end_stack.pop();
     if (!gfx_path.empty()) {
         gfx_path.pop_back();
     }
 
     while (cmd_stack.size() > 0 && cmd_stack.top() == nullptr) {
         cmd_stack.pop();
+        bounds_end_stack.pop();
         if (!gfx_path.empty()) {
             gfx_path.pop_back();
         }
@@ -8988,7 +9069,8 @@ static void gfx_step() {
      * Run's outer loop will pick up the parent frame (or exit if stack is
      * empty). */
     {
-        if (sDLBoundsCheck && sDLBoundsCheck((uintptr_t)cmd) == kDLBoundsWalkedPast) {
+        const uintptr_t boundsEnd = g_exec_stack.currBoundsEnd();
+        if (boundsEnd != 0 && (uintptr_t)cmd >= boundsEnd) {
             static int sCount = 0;
             if (sCount < 10) {
                 sCount++;
