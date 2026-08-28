@@ -1417,7 +1417,7 @@ Interpreter::Interpreter() {
     /* The Vita presentation path is pinned to 1x MSAA. Initializing GXM at
      * 4x here cannot be undone by the later Fast3D SetMsaaLevel(1) call and
      * needlessly multiplies render-target bandwidth on this hardware. */
-    vglInitWithCustomThreshold(0, 960, 544, 32 * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_NONE);
+    vglInitWithCustomThreshold(0, 960, 544, 32 * 1024 * 1024, 0, 0, 0x8C6000, SCE_GXM_MULTISAMPLE_NONE);
 #if defined(SSB64_VITA_TRIPLE_BUFFERING) && SSB64_VITA_TRIPLE_BUFFERING
     port_log("SSB64: vitaGL config param=4MiB circular=8MiB display_buffers=3 "
 #else
