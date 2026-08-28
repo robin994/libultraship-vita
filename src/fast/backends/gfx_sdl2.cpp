@@ -55,6 +55,7 @@ LONG_PTR SDL_WndProc;
 #include <vitasdk.h>
 extern "C" void vglSwapBuffers(GLboolean has_commondialog);
 extern "C" void port_log(const char* fmt, ...);
+extern "C" int port_netplay_common_dialog_active(void);
 #if defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG
 static uint32_t sVitaLastPaceUs = 0;
 static uint32_t sVitaLastSwapUs = 0;
@@ -888,7 +889,10 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
                  (unsigned int)sVitaSwapCount);
     }
 #endif
-    vglSwapBuffers(GL_FALSE);
+    // Keep the direct vitaGL present path unchanged during normal gameplay.
+    // Sony Common Dialogs need vitaGL to call sceCommonDialogUpdate while they
+    // are active; the PSP AdHoc NetCheck dialog is the only netplay user.
+    vglSwapBuffers(port_netplay_common_dialog_active() ? GL_TRUE : GL_FALSE);
 #if (defined(SSB64_VITA_RUNTIME_DIAG) && SSB64_VITA_RUNTIME_DIAG) || \
     (defined(SSB64_VITA_SLOW_FRAME_DIAG) && SSB64_VITA_SLOW_FRAME_DIAG)
     const uint32_t swapUs = sceKernelGetProcessTimeLow() - swapStartUs;
