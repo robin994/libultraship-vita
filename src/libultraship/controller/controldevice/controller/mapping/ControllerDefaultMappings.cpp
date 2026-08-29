@@ -71,23 +71,44 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
         return;
     }
 
+#ifdef __vita__
+    // SSB64-on-Vita layout, modeled on the SSB64 3DS port. The Vita has no
+    // analog triggers, so the N64 shoulder/Z functions move onto the physical
+    // shoulder buttons:
+    //   Circle (B)   -> A_BUTTON   attack
+    //   Cross  (A)   -> B_BUTTON   special
+    //   Triangle (Y) -> U_CBUTTONS jump
+    //   Square (X)   -> L_CBUTTONS jump
+    //   L            -> R_TRIG     grab (SSB64 turns R_TRIG into A+Z)
+    //   R            -> Z_TRIG     shield
+    //   D-pad (any)  -> L_TRIG     taunt / appeal
+    //   Start        -> pause
+    // Menu navigation and the optional right-stick smashes come from the
+    // stick-direction defaults (left stick = N64 stick, right stick = C-buttons).
+    Ship::ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings({
+        { BTN_A, { SDL_CONTROLLER_BUTTON_B } },
+        { BTN_B, { SDL_CONTROLLER_BUTTON_A } },
+        { BTN_CUP, { SDL_CONTROLLER_BUTTON_Y } },
+        { BTN_CLEFT, { SDL_CONTROLLER_BUTTON_X } },
+        { BTN_R, { SDL_CONTROLLER_BUTTON_LEFTSHOULDER } },
+        { BTN_Z, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
+        { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
+        { BTN_L,
+          { SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+            SDL_CONTROLLER_BUTTON_DPAD_RIGHT } },
+    });
+#else
     Ship::ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings({
         { BTN_A, { SDL_CONTROLLER_BUTTON_A } },
         { BTN_B, { SDL_CONTROLLER_BUTTON_B } },
         { BTN_L, { SDL_CONTROLLER_BUTTON_LEFTSHOULDER } },
-#ifdef __vita__
-        // Vita has no L2/R2 trigger axes. Keep every N64 gameplay action
-        // reachable using the physical controls that actually exist.
-        { BTN_R, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
-        { BTN_Z, { SDL_CONTROLLER_BUTTON_X } },
-        { BTN_CUP, { SDL_CONTROLLER_BUTTON_Y } },
-#endif
         { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
         { BTN_DUP, { SDL_CONTROLLER_BUTTON_DPAD_UP } },
         { BTN_DDOWN, { SDL_CONTROLLER_BUTTON_DPAD_DOWN } },
         { BTN_DLEFT, { SDL_CONTROLLER_BUTTON_DPAD_LEFT } },
         { BTN_DRIGHT, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT } },
     });
+#endif
 }
 
 void ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings(

@@ -111,42 +111,24 @@ void ControlDeck::Init(uint8_t* controllerBits) {
     }
 
 #ifdef __vita__
-    /* Existing Vita installs already have HasConfig=1, so changing the
-     * platform defaults alone would leave their old L2/R2-only R/Z mappings
-     * in place forever. Apply this migration once, adding only the physical
-     * Vita bindings introduced by the fix; later user edits are respected. */
-    constexpr int32_t kVitaButtonLayoutVersion = 1;
+    /* Existing Vita installs already have HasConfig=1, so changing the platform
+     * SDL-gamepad defaults alone would never reach them. Bump this version and
+     * the migration re-applies the current defaults to every port's gamepad
+     * bindings once (keyboard/mouse untouched, and it only runs when the stored
+     * version is behind). v2 = the SSB64-3DS-style layout (A/B swap, shoulders
+     * become R_TRIG/Z_TRIG, D-pad taunts). Any hand-customized gamepad binding
+     * is reset by this one-time pass; users can rebind afterwards. */
+    constexpr int32_t kVitaButtonLayoutVersion = 2;
     const char* vitaLayoutVersionKey = CVAR_PREFIX_CONTROLLERS ".VitaButtonLayoutVersion";
     auto cvars = Ship::Context::GetInstance()->GetConsoleVariables();
     if (cvars->GetInteger(vitaLayoutVersionKey, 0) < kVitaButtonLayoutVersion) {
-        struct VitaButtonBinding {
-            CONTROLLERBUTTONS_T bitmask;
-            SDL_GameControllerButton button;
-        };
-        static constexpr VitaButtonBinding kVitaBindings[] = {
-            { BTN_R, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
-            { BTN_Z, SDL_CONTROLLER_BUTTON_X },
-            { BTN_CUP, SDL_CONTROLLER_BUTTON_Y },
-        };
-
         for (auto& port : mPorts) {
             auto controller = port->GetConnectedController();
             if (controller == nullptr) {
                 continue;
             }
-            for (const auto& binding : kVitaBindings) {
-                auto logicalButton = controller->GetButton(binding.bitmask);
-                if (logicalButton == nullptr) {
-                    continue;
-                }
-                auto mapping = std::make_shared<SDLButtonToButtonMapping>(
-                    controller->GetPortIndex(), binding.bitmask, binding.button);
-                if (logicalButton->GetButtonMappingById(mapping->GetButtonMappingId()) == nullptr) {
-                    logicalButton->AddButtonMapping(mapping);
-                    mapping->SaveToConfig();
-                    logicalButton->SaveButtonMappingIdsToConfig();
-                }
-            }
+            controller->ClearAllMappingsForDeviceType(PhysicalDeviceType::SDLGamepad);
+            controller->AddDefaultMappings(PhysicalDeviceType::SDLGamepad);
         }
         cvars->SetInteger(vitaLayoutVersionKey, kVitaButtonLayoutVersion);
         cvars->Save();
