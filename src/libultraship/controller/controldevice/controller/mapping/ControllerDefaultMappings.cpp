@@ -81,10 +81,13 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
     //   Square (X)   -> L_CBUTTONS jump
     //   L            -> R_TRIG     grab (SSB64 turns R_TRIG into A+Z)
     //   R            -> Z_TRIG     shield
-    //   D-pad (any)  -> L_TRIG     taunt / appeal
+    //   D-pad        -> N64 D-pad  (menu nav; the port shim also emulates the
+    //                  left stick with it in gameplay)
+    //   Right stick  -> taunt      (flick, via the port shim) + C-buttons
     //   Start        -> pause
-    // Menu navigation and the optional right-stick smashes come from the
-    // stick-direction defaults (left stick = N64 stick, right stick = C-buttons).
+    // The D-pad / right-stick behaviour above is forced in the port shim
+    // (decomp/src/sys/controller.c, syControllerVitaForceDPad) straight from
+    // sceCtrl, so it holds even over an old saved binding config.
     Ship::ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings({
         { BTN_A, { SDL_CONTROLLER_BUTTON_B } },
         { BTN_B, { SDL_CONTROLLER_BUTTON_A } },
@@ -93,9 +96,10 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
         { BTN_R, { SDL_CONTROLLER_BUTTON_LEFTSHOULDER } },
         { BTN_Z, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
         { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
-        { BTN_L,
-          { SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT,
-            SDL_CONTROLLER_BUTTON_DPAD_RIGHT } },
+        { BTN_DUP, { SDL_CONTROLLER_BUTTON_DPAD_UP } },
+        { BTN_DDOWN, { SDL_CONTROLLER_BUTTON_DPAD_DOWN } },
+        { BTN_DLEFT, { SDL_CONTROLLER_BUTTON_DPAD_LEFT } },
+        { BTN_DRIGHT, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT } },
     });
 #else
     Ship::ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings({
